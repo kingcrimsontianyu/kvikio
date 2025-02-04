@@ -11,7 +11,28 @@
   "runArgs": [
     "--rm",
     "--name",
-    "${localEnv:USER:anon}-rapids-${localWorkspaceFolderBasename}-25.04-cuda12.8-pip"
+    "${localEnv:USER:anon}-rapids-${localWorkspaceFolderBasename}-25.04-cuda12.8-pip",
+    "--gpus=all",
+    "-v",
+    "/run/udev:/run/udev",
+    "-v",
+    "/sys/kernel/config:/sys/kernel/config",
+    "-v",
+    "/dev:/dev",
+    "-v",
+    "/lib/modules/6.8.0-52-generic:/lib/modules/6.8.0-52-generic",
+    "-v",
+    "/usr/local/cuda/gds:/mnt/cuda_gds",
+    "-v",
+    "/mnt/nvme_ubuntu_test:/mnt/nvme_ubuntu_test",
+    "-v",
+    "/home/biubiuty/biubiu/MagnumIO:/mnt/MagnumIO",
+    "-v",
+    "${localEnv:HOME}/biubiu_fio:/mnt/fio",
+    "-v",
+    "${localEnv:HOME}/.ssh:/home/coder/.ssh",
+    "--privileged",
+    "--cap-add=SYS_ADMIN"
   ],
   "hostRequirements": {"gpu": "optional"},
   "features": {
@@ -37,5 +58,6 @@
         "nvidia.nsight-vscode-edition"
       ]
     }
-  }
+  },
+  "postCreateCommand":"/bin/bash /home/coder/kvikio/.devcontainer/cuda12.8-pip/post_create_command.sh"
 }
