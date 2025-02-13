@@ -211,11 +211,17 @@ std::future<std::size_t> FileHandle::pread(void* buf,
 
   // Shortcut that circumvent the threadpool and use the POSIX backend directly.
   if (size < gds_threshold) {
-    PushAndPopContext c(ctx);
-    auto bytes_read = detail::posix_device_read(_fd_direct_off.fd(), buf, size, file_offset, 0);
-    // Maintain API consistency while making this trivial case synchronous.
-    // The result in the future is immediately available after the call.
-    return make_ready_future(bytes_read);
+    auto task = [this, ctx, buf, size, file_offset]() -> std::size_t {
+      PushAndPopContext c(ctx);
+      return detail::posix_device_read(_fd_direct_off.fd(), buf, size, file_offset, 0);
+    };
+    return std::async(std::launch::deferred, task);
+
+    // PushAndPopContext c(ctx);
+    // auto bytes_read = detail::posix_device_read(_fd_direct_off.fd(), buf, size, file_offset, 0);
+    // // Maintain API consistency while making this trivial case synchronous.
+    // // The result in the future is immediately available after the call.
+    // return make_ready_future(bytes_read);
   }
 
   // Let's synchronize once instead of in each task.
@@ -261,11 +267,18 @@ std::future<std::size_t> FileHandle::pwrite(void const* buf,
 
   // Shortcut that circumvent the threadpool and use the POSIX backend directly.
   if (size < gds_threshold) {
-    PushAndPopContext c(ctx);
-    auto bytes_write = detail::posix_device_write(_fd_direct_off.fd(), buf, size, file_offset, 0);
-    // Maintain API consistency while making this trivial case synchronous.
-    // The result in the future is immediately available after the call.
-    return make_ready_future(bytes_write);
+    auto task = [this, ctx, buf, size, file_offset]() -> std::size_t {
+      PushAndPopContext c(ctx);
+      return detail::posix_device_write(_fd_direct_off.fd(), buf, size, file_offset, 0);
+    };
+    return std::async(std::launch::deferred, task);
+
+    // PushAndPopContext c(ctx);
+    // auto bytes_write = detail::posix_device_write(_fd_direct_off.fd(), buf, size, file_offset,
+    // 0);
+    // // Maintain API consistency while making this trivial case synchronous.
+    // // The result in the future is immediately available after the call.
+    // return make_ready_future(bytes_write);
   }
 
   // Let's synchronize once instead of in each task.
