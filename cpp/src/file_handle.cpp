@@ -215,7 +215,7 @@ std::future<std::size_t> FileHandle::pread(void* buf,
       PushAndPopContext c(ctx);
       return detail::posix_device_read(_fd_direct_off.fd(), buf, size, file_offset, 0);
     };
-    return detail::submit_task(task);
+    return std::async(std::launch::deferred, task);
 
     // PushAndPopContext c(ctx);
     // auto bytes_read = detail::posix_device_read(_fd_direct_off.fd(), buf, size, file_offset, 0);
@@ -271,7 +271,7 @@ std::future<std::size_t> FileHandle::pwrite(void const* buf,
       PushAndPopContext c(ctx);
       return detail::posix_device_write(_fd_direct_off.fd(), buf, size, file_offset, 0);
     };
-    return detail::submit_task(task);
+    return std::async(std::launch::deferred, task);
 
     // PushAndPopContext c(ctx);
     // auto bytes_write = detail::posix_device_write(_fd_direct_off.fd(), buf, size, file_offset,
