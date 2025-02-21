@@ -20,6 +20,7 @@
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
 #include <kvikio/error.hpp>
+#include <kvikio/nvtx.hpp>
 #include <kvikio/shim/cuda.hpp>
 
 namespace kvikio {
@@ -42,8 +43,10 @@ std::size_t AllocRetain::Alloc::size() noexcept { return _size; }
 
 std::size_t AllocRetain::_clear()
 {
+  KVIKIO_NVTX_SCOPED_RANGE("AllocRetain::_clear", _size);
   std::size_t ret = _free_allocs.size() * _size;
   while (!_free_allocs.empty()) {
+    KVIKIO_NVTX_SCOPED_RANGE("AllocRetain::cuMemFreeHost", _size);
     CUDA_DRIVER_TRY(cudaAPI::instance().MemFreeHost(_free_allocs.top()));
     _free_allocs.pop();
   }
@@ -61,6 +64,7 @@ void AllocRetain::_ensure_alloc_size()
 
 AllocRetain::Alloc AllocRetain::get()
 {
+  KVIKIO_NVTX_SCOPED_RANGE("AllocRetain::get", _size);
   std::lock_guard const lock(_mutex);
   _ensure_alloc_size();
 
@@ -75,12 +79,16 @@ AllocRetain::Alloc AllocRetain::get()
   void* alloc{};
   // Allocate page-locked host memory
   // Under unified addressing, host memory allocated this way is automatically portable and mapped.
-  CUDA_DRIVER_TRY(cudaAPI::instance().MemHostAlloc(&alloc, _size, CU_MEMHOSTALLOC_PORTABLE));
+  {
+    KVIKIO_NVTX_SCOPED_RANGE("AllocRetain::cuMemHostAlloc", _size);
+    CUDA_DRIVER_TRY(cudaAPI::instance().MemHostAlloc(&alloc, _size, CU_MEMHOSTALLOC_PORTABLE));
+  }
   return Alloc(this, alloc, _size);
 }
 
 void AllocRetain::put(void* alloc, std::size_t size)
 {
+  KVIKIO_NVTX_SCOPED_RANGE("AllocRetain::put", size);
   std::lock_guard const lock(_mutex);
   _ensure_alloc_size();
 
