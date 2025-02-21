@@ -24,6 +24,29 @@ PC
     "--privileged",
     "--cap-add=SYS_ADMIN"
 
+lego-cg1-qs-203
+    "--name",
+    "${localEnv:USER:anon}-rapids-${localWorkspaceFolderBasename}-25.04-cuda12.8-pip",
+    "--gpus=all",
+    "-v",
+    "/run/udev:/run/udev",
+    "-v",
+    "/sys/kernel/config:/sys/kernel/config",
+    "-v",
+    "/dev:/dev",
+    "-v",
+    "/lib/modules/6.8.0-1021-nvidia-64k:/lib/modules/6.8.0-1021-nvidia-64k",
+    "-v",
+    "/usr/local/cuda/gds:/mnt/cuda/gds",
+    "-v",
+    "/nvme/1/tialiu:/mnt/nvme",
+    "-v",
+    "${localEnv:HOME}/biubiu:/mnt/biubiu",
+    "-v",
+    "${localEnv:HOME}/.ssh:/home/coder/.ssh",
+    "--privileged",
+    "--cap-add=SYS_ADMIN"
+
 ipp1-3304
     "--name",
     "${localEnv:USER:anon}-rapids-${localWorkspaceFolderBasename}-25.04-cuda12.8-pip",
@@ -37,11 +60,11 @@ ipp1-3304
     "-v",
     "/lib/modules/5.4.0-182-generic:/lib/modules/5.4.0-182-generic",
     "-v",
-    "/usr/local/cuda/gds:/mnt/cuda_gds",
+    "/usr/local/cuda/gds:/mnt/cuda/gds",
     "-v",
     "/raid/tialiu:/mnt/nvme",
     "-v",
-    "${localEnv:HOME}/biubiu_fio:/mnt/fio",
+    "${localEnv:HOME}/biubiu:/mnt/biubiu",
     "-v",
     "${localEnv:HOME}/.ssh:/home/coder/.ssh",
     "--privileged",
