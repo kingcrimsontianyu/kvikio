@@ -18,13 +18,10 @@
 #include <cstdint>
 #include <iostream>
 
-#include <benchmark/benchmark.h>
 #include <kvikio/defaults.hpp>
+#include <nvbench/nvbench.cuh>
 
-enum ScalingType : int64_t {
-  StrongScaling,
-  WeakScaling,
-};
+namespace kvikio {
 
 void task_compute(std::size_t num_compute_iterations)
 {
@@ -35,25 +32,23 @@ void task_compute(std::size_t num_compute_iterations)
   }
 }
 
-void BM_threadpool_compute(benchmark::State& state)
+void NVB_threadpool_compute(nvbench::state& state)
 {
-  auto num_threads        = state.range(0);
-  auto compute_bench_type = state.range(1);
+  auto num_threads  = state.get_int64("num_threads");
+  auto scaling_type = state.get_string("scaling_type");
 
   std::string label;
   std::size_t num_compute_tasks;
-  if (compute_bench_type == ScalingType::StrongScaling) {
-    num_compute_tasks = 1'0000;
-    label             = "strong_scaling";
-  } else {
+  if (scaling_type == "strong") {
+    num_compute_tasks = 1000;
+  } else {  // "weak"
     num_compute_tasks = 1000 * num_threads;
-    label             = "weak_scaling";
   }
-  state.SetLabel(label);
-  std::size_t const num_compute_iterations{100'000};
+
+  std::size_t const num_compute_iterations{10000};
   kvikio::defaults::set_thread_pool_nthreads(num_threads);
 
-  for (auto _ : state) {
+  state.exec([=](nvbench::launch&) {
     for (std::size_t i = 0u; i < num_compute_tasks; ++i) {
       [[maybe_unused]] auto fut = kvikio::defaults::thread_pool().submit_task(
         [num_compute_iterations = num_compute_iterations] {
@@ -61,23 +56,11 @@ void BM_threadpool_compute(benchmark::State& state)
         });
     }
     kvikio::defaults::thread_pool().wait();
-  }
-
-  state.counters["threads"] = num_threads;
+  });
 }
 
-int main(int argc, char** argv)
-{
-  benchmark::Initialize(&argc, argv);
+NVBENCH_BENCH(NVB_threadpool_compute)
+  .add_int64_axis("num_threads", {1, 2, 4, 8, 16, 32, 64})
+  .add_string_axis("scaling_type", {"strong", "weak"});
 
-  benchmark::RegisterBenchmark("BM_threadpool_compute:strong_scaling", BM_threadpool_compute)
-    ->ArgsProduct({{1, 2, 4, 8, 16, 32, 64}, {ScalingType::StrongScaling}})
-    ->Unit(benchmark::kMillisecond);
-
-  benchmark::RegisterBenchmark("BM_threadpool_compute:weak_scaling", BM_threadpool_compute)
-    ->ArgsProduct({{1, 2, 4, 8, 16, 32, 64}, {ScalingType::WeakScaling}})
-    ->Unit(benchmark::kMillisecond);
-
-  benchmark::RunSpecifiedBenchmarks();
-  benchmark::Shutdown();
-}
+}  // namespace kvikio

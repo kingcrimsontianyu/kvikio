@@ -70,6 +70,10 @@ endif()
 
 set(cuFile_FOUND 0)
 if(KvikIO_CUDA_SUPPORT)
+  include(rapids-cuda)
+  rapids_cuda_init_architectures(KvikIO)
+  enable_language(CUDA)
+
   rapids_find_package(
     CUDAToolkit REQUIRED
     BUILD_EXPORT_SET kvikio-exports
@@ -208,11 +212,12 @@ set_target_properties(
 # * add benchmarks --------------------------------------------------------------------------------
 
 if(KvikIO_BUILD_BENCHMARKS)
-  # Find or install GoogleBench
-  include(${rapids-cmake-dir}/cpm/gbench.cmake)
-  rapids_cpm_gbench(BUILD_STATIC)
-
-  add_subdirectory(benchmarks)
+  if(KvikIO_CUDA_SUPPORT)
+    include(cmake/thirdparty/get_nvbench.cmake) # Find or install nvbench
+    add_subdirectory(benchmarks)
+  else()
+    message(WARNING "Cannot build the benchmark programs if CUDA is not used.")
+  endif()
 endif()
 
 # ##################################################################################################
