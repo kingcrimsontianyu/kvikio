@@ -60,3 +60,7 @@ function(kvikio_add_benchmark)
 endfunction()
 
 kvikio_add_benchmark(NAME THREADPOOL_BENCHMARK SOURCES "threadpool/threadpool_benchmark.cpp")
+
+kvikio_add_benchmark(NAME MMAP_BENCHMARK SOURCES "mmap/mmap_read_benchmark.cpp")
+
+kvikio_add_benchmark(NAME STANDARD_BENCHMARK SOURCES "standard/standard_read_benchmark.cpp")
