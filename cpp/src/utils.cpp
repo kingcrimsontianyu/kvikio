@@ -77,6 +77,23 @@ bool is_host_memory(void const* ptr)
 }
 #endif
 
+bool is_unified_memory(void const* ptr)
+{
+  CUpointer_attribute attrs[1] = {
+    CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+  };
+  CUmemorytype memtype{};
+  void* data[1] = {&memtype};
+  CUresult result =
+    cudaAPI::instance().PointerGetAttributes(1, attrs, data, convert_void2deviceptr(ptr));
+
+  // We assume that `ptr` is host memory when CUDA_ERROR_NOT_INITIALIZED
+  if (result == CUDA_ERROR_NOT_INITIALIZED) { return true; }
+  CUDA_DRIVER_TRY(result);
+
+  return memtype == CU_MEMORYTYPE_UNIFIED;
+}
+
 int get_device_ordinal_from_pointer(CUdeviceptr dev_ptr)
 {
   int ret = 0;

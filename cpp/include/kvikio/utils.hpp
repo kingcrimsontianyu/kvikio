@@ -79,6 +79,8 @@ bool is_host_memory(void const* ptr);
 constexpr bool is_host_memory(void const* ptr) { return true; }
 #endif
 
+bool is_unified_memory(void const* ptr);
+
 /**
  * @brief Return the device owning the pointer
  *

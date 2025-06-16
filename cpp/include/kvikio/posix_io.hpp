@@ -144,12 +144,21 @@ std::size_t posix_device_io(int fd,
   // Get a stream for the current CUDA context and thread
   CUstream stream = StreamsByThread::get();
 
+  auto is_dev_unified_memory = is_unified_memory(devPtr_base);
+  auto device_ordinal        = get_device_ordinal_from_pointer(convert_void2deviceptr(devPtr_base));
+
   while (byte_remaining > 0) {
     off_t const nbytes_requested = std::min(chunk_size2, byte_remaining);
     ssize_t nbytes_got           = nbytes_requested;
     if constexpr (Operation == IOOperationType::READ) {
       nbytes_got = posix_host_io<IOOperationType::READ, PartialIO::YES>(
         fd, alloc.get(), nbytes_requested, cur_file_offset);
+      if (is_dev_unified_memory) {
+        CUmemLocation mem_location{.type = CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+                                   .id   = device_ordinal};
+        CUDA_DRIVER_TRY(cudaAPI::instance().MemPrefetchAsync_v2(
+          devPtr, nbytes_got, mem_location, 0 /* flags */, stream));
+      }
       CUDA_DRIVER_TRY(cudaAPI::instance().MemcpyHtoDAsync(devPtr, alloc.get(), nbytes_got, stream));
       CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
     } else {  // Is a write operation

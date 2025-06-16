@@ -74,5 +74,6 @@ CUresult cuDevicePrimaryCtxRelease(...);
 CUresult cuStreamCreate(...);
 CUresult cuStreamDestroy(...);
 CUresult cuStreamSynchronize(...);
+CUresult cuMemPrefetchAsync_v2(...);
 
 #endif

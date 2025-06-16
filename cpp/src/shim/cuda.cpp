@@ -47,6 +47,7 @@ cudaAPI::cudaAPI()
   get_symbol(StreamSynchronize, lib, KVIKIO_STRINGIFY(cuStreamSynchronize));
   get_symbol(StreamCreate, lib, KVIKIO_STRINGIFY(cuStreamCreate));
   get_symbol(StreamDestroy, lib, KVIKIO_STRINGIFY(cuStreamDestroy));
+  get_symbol(MemPrefetchAsync_v2, lib, KVIKIO_STRINGIFY(cuMemPrefetchAsync_v2));
 }
 #else
 cudaAPI::cudaAPI() { KVIKIO_FAIL("KvikIO not compiled with CUDA support", std::runtime_error); }
