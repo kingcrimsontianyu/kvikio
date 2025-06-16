@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#include <gtest/gtest.h>
 #include <kvikio/defaults.hpp>
 #include <kvikio/file_handle.hpp>
+#include <utility>
 #include "utils/utils.hpp"
 
 using namespace kvikio::test;
@@ -27,7 +29,7 @@ class BasicIOTest : public testing::Test {
     TempDir tmp_dir{false};
     _filepath = tmp_dir.path() / "test";
 
-    _dev_a = std::move(DevBuffer::arange(100));
+    _dev_a = std::move(DevBuffer::arange(1024ull * 1024ull));
     _dev_b = std::move(DevBuffer::zero_like(_dev_a));
   }
 
@@ -36,6 +38,7 @@ class BasicIOTest : public testing::Test {
   std::filesystem::path _filepath;
   DevBuffer _dev_a;
   DevBuffer _dev_b;
+  using value_type = decltype(std::declval<DevBuffer>().to_vector())::value_type;
 };
 
 TEST_F(BasicIOTest, write_read)
@@ -95,4 +98,31 @@ TEST_F(BasicIOTest, write_read_async)
   }
 
   CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
+}
+
+TEST_F(BasicIOTest, unified_memory_read)
+{
+  void* buf{};
+  auto num_bytes    = _dev_a.nbytes;
+  auto num_elements = _dev_a.nelem;
+  KVIKIO_CHECK_CUDA(cudaMallocManaged(&buf, num_bytes));
+
+  {
+    kvikio::FileHandle f(_filepath, "w");
+    f.write(_dev_a.ptr, _dev_a.nbytes, 0, 0);
+  }
+
+  {
+    kvikio::FileHandle f(_filepath, "r");
+    auto fut       = f.pread(buf, num_bytes);
+    auto read_size = fut.get();
+    EXPECT_EQ(read_size, num_bytes);
+    auto expected_result = _dev_a.to_vector();
+    for (std::size_t i = 0; i < num_elements; ++i) {
+      auto* actual_result = reinterpret_cast<value_type*>(buf);
+      EXPECT_EQ(expected_result[i], actual_result[i]);
+    }
+  }
+
+  KVIKIO_CHECK_CUDA(cudaFree(buf));
 }

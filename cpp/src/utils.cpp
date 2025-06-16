@@ -79,19 +79,36 @@ bool is_host_memory(void const* ptr)
 
 bool is_unified_memory(void const* ptr)
 {
-  CUpointer_attribute attrs[1] = {
-    CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+// Presumably a CUDA bug: crash due to stack smashing.
+// The workaround is to use cuPointerGetAttributes() which queries an array of attributes.
+#if 0
+  bool result{};
+  cudaAPI::instance().PointerGetAttribute(
+    &result, CU_POINTER_ATTRIBUTE_IS_MANAGED, convert_void2deviceptr(ptr));
+  return result;
+#endif
+
+// Presumably a CUDA bug: mem_type is device instead of unified.
+#if 0
+  CUmemorytype mem_type{};
+  cudaAPI::instance().PointerGetAttribute(
+    &mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, convert_void2deviceptr(ptr));
+  return mem_type == CUmemorytype::CU_MEMORYTYPE_UNIFIED;
+#endif
+
+  CUpointer_attribute attrs[] = {
+    CU_POINTER_ATTRIBUTE_IS_MANAGED,
   };
-  CUmemorytype memtype{};
-  void* data[1] = {&memtype};
+  bool is_managed{};
+  void* data[] = {&is_managed};
   CUresult result =
     cudaAPI::instance().PointerGetAttributes(1, attrs, data, convert_void2deviceptr(ptr));
 
   // We assume that `ptr` is host memory when CUDA_ERROR_NOT_INITIALIZED
-  if (result == CUDA_ERROR_NOT_INITIALIZED) { return true; }
+  if (result == CUDA_ERROR_NOT_INITIALIZED) { return false; }
   CUDA_DRIVER_TRY(result);
 
-  return memtype == CU_MEMORYTYPE_UNIFIED;
+  return is_managed;
 }
 
 int get_device_ordinal_from_pointer(CUdeviceptr dev_ptr)
