@@ -153,17 +153,13 @@ std::size_t posix_device_io(int fd,
     if constexpr (Operation == IOOperationType::READ) {
       nbytes_got = posix_host_io<IOOperationType::READ, PartialIO::YES>(
         fd, alloc.get(), nbytes_requested, cur_file_offset);
-
       if (is_dev_unified_memory) {
         CUmemLocation mem_location{.type = CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
                                    .id   = device_ordinal};
-        CUDA_DRIVER_TRY(
-          cudaAPI::instance().MemPrefetchAsync_v2(devPtr, nbytes_got, mem_location, 0, stream));
-      } else {
-        CUDA_DRIVER_TRY(
-          cudaAPI::instance().MemcpyHtoDAsync(devPtr, alloc.get(), nbytes_got, stream));
+        CUDA_DRIVER_TRY(cudaAPI::instance().MemPrefetchAsync_v2(
+          devPtr, nbytes_got, mem_location, 0 /* flags */, stream));
       }
-
+      CUDA_DRIVER_TRY(cudaAPI::instance().MemcpyHtoDAsync(devPtr, alloc.get(), nbytes_got, stream));
       CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
     } else {  // Is a write operation
       CUDA_DRIVER_TRY(
