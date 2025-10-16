@@ -49,6 +49,7 @@ cdef extern from "<kvikio/file_handle.hpp>" namespace "kvikio" nogil:
         bool closed()
         int fd()
         int fd_open_flags() except +
+        size_t nbytes() except +
         future[size_t] pread(
             void* devPtr,
             size_t size,
@@ -124,6 +125,12 @@ cdef class CuFile:
         cdef int result
         with nogil:
             result = self._handle.fd_open_flags()
+        return result
+
+    def nbytes(self) -> int:
+        cdef size_t result
+        with nogil:
+            result = self._handle.nbytes()
         return result
 
     def pread(self, buf, size: Optional[int], file_offset: int, task_size) -> IOFuture:

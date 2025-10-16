@@ -4,7 +4,7 @@
 import io
 import os
 import pathlib
-from typing import Optional, Union
+from typing import Optional, Union, overload
 
 from kvikio._lib import file_handle  # type: ignore
 
@@ -66,10 +66,12 @@ class IOFuture:
         return self._handle.done()
 
 
-class CuFile:
+class CuFile(io.RawIOBase):
     """File handle for GPUDirect Storage (GDS)"""
 
-    def __init__(self, file: Union[pathlib.Path, str], flags: str = "r"):
+    def __init__(
+        self, file: Union[pathlib.Path, str], flags: str = "r", seekable: bool = True
+    ):
         """Open and register file for GDS IO operations
 
         CuFile opens the file twice and maintains two file descriptors.
@@ -87,7 +89,21 @@ class CuFile:
             "a" -> "open for writing, appending to the end of file if it exists"
             "+" -> "open for updating (reading and writing)"
         """
+        super().__init__()
         self._handle = file_handle.CuFile(file, flags)
+        self._seekable = seekable
+        self._flags = flags
+
+        self._pos = None
+        self._size = None
+
+        if self._seekable:
+            self._pos = 0
+            self._size = 0
+
+            # If opening in append mode, set position to end
+            if "a" in flags:
+                self._pos = self._size
 
     def close(self) -> None:
         """Deregister the file and close the file"""
@@ -99,11 +115,27 @@ class CuFile:
 
     def fileno(self) -> int:
         """Get the file descriptor of the open file"""
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
         return self._handle.fileno()
 
     def open_flags(self) -> int:
         """Get the flags of the file descriptor (see open(2))"""
         return self._handle.open_flags()
+
+    def readable(self) -> bool:
+        """Return whether the file is open for reading"""
+        return not self.closed and ("r" in self._flags or "+" in self._flags)
+
+    def writable(self) -> bool:
+        """Return whether the file is open for writing"""
+        return not self.closed and (
+            "w" in self._flags or "a" in self._flags or "+" in self._flags
+        )
+
+    def seekable(self) -> bool:
+        """Return whether the file supports seek and tell operations"""
+        return self._seekable and not self.closed
 
     def __enter__(self) -> "CuFile":
         return self
@@ -205,6 +237,11 @@ class CuFile:
         """
         return IOFuture(self._handle.pwrite(buf, size, file_offset, task_size))
 
+    @overload
+    def read(self, size: int = -1) -> bytes:
+        ...
+
+    @overload
     def read(
         self,
         buf,
@@ -212,6 +249,9 @@ class CuFile:
         file_offset: int = 0,
         task_size: Optional[int] = None,
     ) -> int:
+        ...
+
+    def read(self, *args, **kwargs) -> Union[bytes, int]:
         """Reads specified bytes from the file into the device memory in parallel
 
         This is a blocking version of `.pread`.
@@ -242,7 +282,28 @@ class CuFile:
         any undesired bytes from the resulting data. Similarly, it is optimal for `size`
         to be a multiple of 4096 bytes. When GDS isn't used, this is less critical.
         """
-        return self.pread(buf, size, file_offset, task_size).get()
+
+        if args:
+            first_arg = args[0]
+            is_buffer = not isinstance(first_arg, int)
+        elif "buf" in kwargs:
+            # Explicitly using buf= keyword means KvikIO API
+            first_arg = kwargs.pop("buf")
+            is_buffer = True
+        else:
+            # No positional args and no 'buf' kwarg - must be Python IO API
+            first_arg = kwargs.get("size", -1)
+            is_buffer = False
+
+        if not is_buffer:
+            return bytes()
+        else:
+            # KvikIO API: read(buf, ...) -> int
+            buf = first_arg
+            size = args[1] if len(args) > 1 else kwargs.get("size")
+            file_offset = args[2] if len(args) > 2 else kwargs.get("file_offset", 0)
+            task_size = args[3] if len(args) > 3 else kwargs.get("task_size")
+            return self.pread(buf, size, file_offset, task_size).get()
 
     def write(
         self,
