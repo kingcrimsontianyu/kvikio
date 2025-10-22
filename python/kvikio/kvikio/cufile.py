@@ -496,7 +496,7 @@ class CuFile(io.RawIOBase):
 
 
 def get_page_cache_info(
-    file: Union[os.PathLike, str, int, io.IOBase]
+    file: Union[os.PathLike, str, int, io.IOBase],
 ) -> tuple[int, int]:
     """Obtain the page cache residency information for a given file
 
