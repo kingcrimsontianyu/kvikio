@@ -92,18 +92,8 @@ class CuFile(io.RawIOBase):
         super().__init__()
         self._handle = file_handle.CuFile(file, flags)
         self._seekable = seekable
-        self._flags = flags
-
-        self._pos = None
-        self._size = None
-
-        if self._seekable:
-            self._pos = 0
-            self._size = 0
-
-            # If opening in append mode, set position to end
-            if "a" in flags:
-                self._pos = self._size
+        self._position = 0
+        self._file_size = self._handle.nbytes()
 
     def close(self) -> None:
         """Deregister the file and close the file"""
@@ -113,35 +103,111 @@ class CuFile(io.RawIOBase):
     def closed(self) -> bool:
         return self._handle.closed()
 
+    def _check_closed(self) -> None:
+        """Internal: raise a ValueError if file is closed"""
+        if self.closed:
+            raise ValueError("Cannot perform I/O operation on closed file")
+
     def fileno(self) -> int:
         """Get the file descriptor of the open file"""
-        if self.closed:
-            raise ValueError("I/O operation on closed file")
+        self._check_closed()
         return self._handle.fileno()
 
     def open_flags(self) -> int:
         """Get the flags of the file descriptor (see open(2))"""
+        self._check_closed()
         return self._handle.open_flags()
-
-    def readable(self) -> bool:
-        """Return whether the file is open for reading"""
-        return not self.closed and ("r" in self._flags or "+" in self._flags)
-
-    def writable(self) -> bool:
-        """Return whether the file is open for writing"""
-        return not self.closed and (
-            "w" in self._flags or "a" in self._flags or "+" in self._flags
-        )
-
-    def seekable(self) -> bool:
-        """Return whether the file supports seek and tell operations"""
-        return self._seekable and not self.closed
 
     def __enter__(self) -> "CuFile":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
+
+    def readable(self) -> bool:
+        """Return whether the file is open for reading"""
+        self._check_closed()
+        flags = self.open_flags()
+        return (flags & os.O_ACCMODE) in (os.O_RDONLY, os.O_RDWR)
+
+    def writable(self) -> bool:
+        """Return whether the file is open for writing"""
+        self._check_closed()
+        flags = self.open_flags()
+        return (flags & os.O_ACCMODE) in (os.O_WRONLY, os.O_RDWR)
+
+    def seekable(self) -> bool:
+        """Return whether the file supports seek and tell operations"""
+        self._check_closed()
+        return self._seekable
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        """Change the stream position to the given byte offset, interpreted
+        relative to the position indicated by whence, and return the new absolute
+        position.
+
+        Parameters
+        ----------
+        offset: int
+            The offset to seek to, relative to whence.
+        whence: int, optional
+            - io.SEEK_SET or 0 (default): seek from the start of the stream. offset
+              should be zero or positive.
+            - io.SEEK_CUR or 1: seek relative to current position. offset may be
+              negative
+            - io.SEEK_END or 2: seek relative to end of file. offset is usually
+              negative
+
+        Returns
+        -------
+        int
+            The new absolute position.
+
+        Raises
+        ------
+        ValueError
+            If the file is closed.
+        OSError
+            If the file is not seekable or invalid whence value.
+        """
+        self._check_closed()
+        if not self._seekable:
+            raise OSError("File is not seekable")
+
+        if whence == io.SEEK_SET:
+            new_pos = offset
+        elif whence == io.SEEK_CUR:
+            new_pos = self._position + offset
+        elif whence == io.SEEK_END:
+            new_pos = self._file_size + offset
+        else:
+            raise OSError(f"Invalid whence value: {whence}")
+
+        if new_pos < 0:
+            raise OSError(f"Negative seek position: {new_pos}")
+
+        self._position = new_pos
+        return self._position
+
+    def tell(self) -> int:
+        """Return current stream position.
+
+        Returns
+        -------
+        int
+            Current position in the file.
+
+        Raises
+        ------
+        ValueError
+            If the file is closed.
+        OSError
+            If the file is not seekable.
+        """
+        self._check_closed()
+        if not self._seekable:
+            raise OSError("File is not seekable")
+        return self._position
 
     def pread(
         self,
@@ -239,6 +305,7 @@ class CuFile(io.RawIOBase):
 
     @overload
     def read(self, size: int = -1) -> bytes:
+        """Read and return up to size bytes (Python io.RawIOBase interface)"""
         ...
 
     @overload
@@ -249,17 +316,98 @@ class CuFile(io.RawIOBase):
         file_offset: int = 0,
         task_size: Optional[int] = None,
     ) -> int:
+        """Reads specified bytes from the file into the device memory in parallel
+        (KvikIO C++ interface)."""
         ...
 
     def read(self, *args, **kwargs) -> Union[bytes, int]:
-        """Reads specified bytes from the file into the device memory in parallel
+        """Reads bytes from the file
+
+        This method supports two signatures:
+
+        1. Python io.RawIOBase interface: read(size=-1) -> bytes
+           Reads and returns up to size bytes from the current position.
+           If size is -1, reads until EOF.
+
+        2. KvikIO C++ interface: read(buf, size=None, file_offset=0, task_size=None) -> int
+           Reads specified bytes from the file into device or host memory in parallel.
+
+        The method automatically detects which interface is being used based on the
+        arguments provided.
+        """
+
+        self._check_closed()
+
+        # Detect which signature is being used
+        if len(args) == 0 or (len(args) == 1 and isinstance(args[0], int)):
+            return self._read_python_rawio(*args, **kwargs)
+        else:
+            return self._read_cpp_kvikio(*args, **kwargs)
+
+    def _read_python_rawio(self, size: int = -1) -> bytes:
+        """Read and return up to size bytes (Python io.RawIOBase interface)
+
+        Parameters
+        ----------
+        size: int, optional
+            Number of bytes to read. If -1, read until EOF.
+
+        Returns
+        -------
+        bytes
+            Bytes read from the file.
+
+        Raises
+        ------
+        ValueError
+            If the file is closed or not readable.
+        """
+        if not self.readable():
+            raise ValueError("File not open for reading")
+
+        if size == -1:
+            size = self._file_size
+
+        if size <= 0 or self._position == self._file_size:
+            return b""
+
+        fd = self.fileno()
+
+        current_position = 0
+        if self._seekable:
+            current_position = self._position
+
+        adjusted_size = min(size, self._file_size - current_position)
+        self._position += adjusted_size
+
+        num_bytes_to_read = adjusted_size
+        raw_data = bytes()
+        while current_position < self._position:
+            current_raw_data = os.pread(
+                fd, num_bytes_to_read, current_position)
+            current_bytes_read = len(current_raw_data)
+
+            raw_data += current_raw_data
+            current_position += current_bytes_read
+
+            num_bytes_to_read = self._position - current_position
+        return raw_data
+
+    def _read_cpp_kvikio(
+        self,
+        buf,
+        size: Optional[int] = None,
+        file_offset: int = 0,
+        task_size: Optional[int] = None,
+    ) -> int:
+        """Reads specified bytes from the file into device or host memory in parallel
 
         This is a blocking version of `.pread`.
 
         Parameters
         ----------
         buf: buffer-like or array-like
-            Device buffer to read into.
+            Device or host buffer to read into.
         size: int, optional
             Size in bytes to read.
         file_offset: int, optional
@@ -282,28 +430,7 @@ class CuFile(io.RawIOBase):
         any undesired bytes from the resulting data. Similarly, it is optimal for `size`
         to be a multiple of 4096 bytes. When GDS isn't used, this is less critical.
         """
-
-        if args:
-            first_arg = args[0]
-            is_buffer = not isinstance(first_arg, int)
-        elif "buf" in kwargs:
-            # Explicitly using buf= keyword means KvikIO API
-            first_arg = kwargs.pop("buf")
-            is_buffer = True
-        else:
-            # No positional args and no 'buf' kwarg - must be Python IO API
-            first_arg = kwargs.get("size", -1)
-            is_buffer = False
-
-        if not is_buffer:
-            return bytes()
-        else:
-            # KvikIO API: read(buf, ...) -> int
-            buf = first_arg
-            size = args[1] if len(args) > 1 else kwargs.get("size")
-            file_offset = args[2] if len(args) > 2 else kwargs.get("file_offset", 0)
-            task_size = args[3] if len(args) > 3 else kwargs.get("task_size")
-            return self.pread(buf, size, file_offset, task_size).get()
+        return self.pread(buf, size, file_offset, task_size).get()
 
     def write(
         self,
