@@ -33,6 +33,12 @@ std::size_t posix_device_read_aligned(int fd_direct_off,
   CUstream stream = StreamCachePerThreadAndContext::get();
 
   while (bytes_remaining > 0) {
+    // Each iteration re-derives alignment from the current file offset rather than assuming the
+    // previous read left us page-aligned. This is necessary because Direct I/O short reads may
+    // return a sector-aligned count (e.g. a multiple of 512 bytes) rather than a page-aligned one,
+    // which would leave cur_file_offset unaligned after advancing by nbytes_processed. Re-aligning
+    // on every iteration ensures we always issue page-aligned Direct I/O requests, at the cost of
+    // potentially re-reading a small prefix that overlaps the previous iteration.
     std::size_t aligned_offset  = align_down(cur_file_offset, page_size);
     std::size_t prefix          = cur_file_offset - aligned_offset;
     std::size_t nbytes_expected = std::min(bytes_remaining, bounce_buffer_size - prefix);
