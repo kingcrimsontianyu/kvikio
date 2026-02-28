@@ -209,21 +209,26 @@ std::size_t posix_device_io(int fd_direct_off,
       "guarantee page alignment. Use CudaPageAlignedPinnedBounceBufferPool instead.");
   }
 
-  auto bounce_buffer             = BounceBufferPoolType::instance().get();
-  CUdeviceptr devPtr             = convert_void2deviceptr(devPtr_base) + devPtr_offset;
-  off_t cur_file_offset          = convert_size2off(file_offset);
-  off_t bytes_remaining          = convert_size2off(size);
-  off_t const bounce_buffer_size = convert_size2off(bounce_buffer.size());
+  auto bounce_buffer                   = BounceBufferPoolType::instance().get();
+  CUdeviceptr devPtr                   = convert_void2deviceptr(devPtr_base) + devPtr_offset;
+  std::size_t const bounce_buffer_size = bounce_buffer.size();
+  std::size_t cur_file_offset          = file_offset;
+  std::size_t bytes_remaining          = size;
 
   // Get a stream for the current CUDA context and thread
   CUstream stream = StreamCachePerThreadAndContext::get();
 
   while (bytes_remaining > 0) {
-    off_t const nbytes_requested = std::min(bounce_buffer_size, bytes_remaining);
-    ssize_t nbytes_io            = nbytes_requested;
+    std::size_t const nbytes_requested = std::min(bounce_buffer_size, bytes_remaining);
+    std::size_t nbytes_io              = nbytes_requested;
     if constexpr (Operation == IOOperationType::READ) {
-      nbytes_io = posix_host_io<IOOperationType::READ, PartialIO::YES>(
-        fd_direct_off, bounce_buffer.get(), nbytes_requested, cur_file_offset, fd_direct_on);
+      ssize_t nbytes_read =
+        posix_host_io<IOOperationType::READ, PartialIO::YES>(fd_direct_off,
+                                                             bounce_buffer.get(),
+                                                             nbytes_requested,
+                                                             convert_size2off(cur_file_offset),
+                                                             fd_direct_on);
+      nbytes_io = static_cast<std::size_t>(nbytes_read);
       CUDA_DRIVER_TRY(
         cudaAPI::instance().MemcpyHtoDAsync(devPtr, bounce_buffer.get(), nbytes_io, stream));
       CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
@@ -231,8 +236,11 @@ std::size_t posix_device_io(int fd_direct_off,
       CUDA_DRIVER_TRY(
         cudaAPI::instance().MemcpyDtoHAsync(bounce_buffer.get(), devPtr, nbytes_requested, stream));
       CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
-      posix_host_io<IOOperationType::WRITE, PartialIO::NO>(
-        fd_direct_off, bounce_buffer.get(), nbytes_requested, cur_file_offset, fd_direct_on);
+      posix_host_io<IOOperationType::WRITE, PartialIO::NO>(fd_direct_off,
+                                                           bounce_buffer.get(),
+                                                           nbytes_requested,
+                                                           convert_size2off(cur_file_offset),
+                                                           fd_direct_on);
     }
     cur_file_offset += nbytes_io;
     devPtr += nbytes_io;
