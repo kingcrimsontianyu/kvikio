@@ -96,13 +96,14 @@ ssize_t posix_host_io(
       nbytes_processed = pread_or_write(fd_direct_off, buffer, bytes_remaining, cur_offset);
     } else {
       // Direct I/O enabled: attempt to use it when alignment allows
-      auto const is_cur_offset_aligned = detail::is_aligned(cur_offset, page_size);
+      auto const is_cur_offset_aligned = is_aligned(cur_offset, page_size);
 
       if (!is_cur_offset_aligned) {
         // Handle unaligned prefix: use buffered I/O to reach next page boundary
         // This ensures subsequent iterations will have page-aligned offsets
-        auto const aligned_cur_offset = detail::align_up(cur_offset, page_size);
-        auto const bytes_requested    = std::min(aligned_cur_offset - cur_offset, bytes_remaining);
+        auto const aligned_cur_offset = align_up(cur_offset, page_size);
+        auto const bytes_requested =
+          std::min(static_cast<size_t>(aligned_cur_offset - cur_offset), bytes_remaining);
         KVIKIO_NVTX_SCOPED_RANGE("Buffered I/O", bytes_requested, color_bio);
         nbytes_processed = pread_or_write(fd_direct_off, buffer, bytes_requested, cur_offset);
       } else {
@@ -112,8 +113,8 @@ ssize_t posix_host_io(
           nbytes_processed = pread_or_write(fd_direct_off, buffer, bytes_remaining, cur_offset);
         } else {
           // Offset is page-aligned. Now make transfer size page-aligned too by rounding down
-          auto aligned_bytes_remaining = detail::align_down(bytes_remaining, page_size);
-          auto const is_buf_aligned    = detail::is_aligned(buffer, page_size);
+          auto aligned_bytes_remaining = align_down(bytes_remaining, page_size);
+          auto const is_buf_aligned    = is_aligned(buffer, page_size);
           auto bytes_requested         = aligned_bytes_remaining;
 
           if (!is_buf_aligned) {
@@ -249,11 +250,28 @@ std::size_t posix_device_io(int fd_direct_off,
   return size;
 }
 
-std::size_t posix_device_read_aligned(int fd_direct_on,
+/**
+ * @brief Read from disk to device memory using pure Direct I/O with over-read alignment
+ *
+ * Unlike `posix_device_io`, this function ensures all file I/O goes through Direct I/O by aligning
+ * the offset down and the size up to page boundaries, then copying only the requested portion to
+ * device memory.
+ *
+ * @param fd_direct_off File descriptor without Direct I/O. Not expected to be used since all inputs
+ * are page-aligned, but passed through to posix_host_io for robustness.
+ * @param devPtr_base Base address of buffer in device memory.
+ * @param size Size in bytes to read.
+ * @param file_offset Offset in the file to read from.
+ * @param devPtr_offset Offset relative to the `devPtr_base` pointer to read into.
+ * @param fd_direct_on File descriptor opened with O_DIRECT.
+ * @return Size of bytes that were successfully read.
+ */
+std::size_t posix_device_read_aligned(int fd_direct_off,
                                       void const* devPtr_base,
                                       std::size_t size,
                                       std::size_t file_offset,
-                                      std::size_t devPtr_offset);
+                                      std::size_t devPtr_offset,
+                                      int fd_direct_on);
 
 /**
  * @brief Read from disk to host memory using POSIX
