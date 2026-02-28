@@ -82,12 +82,16 @@ ssize_t posix_host_io(
   size_t bytes_remaining = count;
   char* buffer           = const_cast<char*>(static_cast<char const*>(buf));
   auto const page_size   = get_page_size();
+  nvtx3::rgb const color_bio{255, 128, 128};
+  nvtx3::rgb const color_dio{128, 255, 128};
+  nvtx3::rgb const color_dio_memcpy{128, 128, 255};
 
   // Process all bytes in a loop (unless PartialIO::YES returns early)
   while (bytes_remaining > 0) {
     ssize_t nbytes_processed{};
 
     if (fd_direct_on == -1) {
+      KVIKIO_NVTX_SCOPED_RANGE("Buffered I/O", bytes_remaining, color_bio);
       // Direct I/O disabled: use buffered I/O for entire transfer
       nbytes_processed = pread_or_write(fd_direct_off, buffer, bytes_remaining, cur_offset);
     } else {
@@ -99,9 +103,11 @@ ssize_t posix_host_io(
         // This ensures subsequent iterations will have page-aligned offsets
         auto const aligned_cur_offset = detail::align_up(cur_offset, page_size);
         auto const bytes_requested    = std::min(aligned_cur_offset - cur_offset, bytes_remaining);
+        KVIKIO_NVTX_SCOPED_RANGE("Buffered I/O", bytes_requested, color_bio);
         nbytes_processed = pread_or_write(fd_direct_off, buffer, bytes_requested, cur_offset);
       } else {
         if (bytes_remaining < page_size) {
+          KVIKIO_NVTX_SCOPED_RANGE("Buffered I/O", bytes_remaining, color_bio);
           // Handle unaligned suffix: remaining bytes are less than a page, use buffered I/O
           nbytes_processed = pread_or_write(fd_direct_off, buffer, bytes_remaining, cur_offset);
         } else {
@@ -117,6 +123,8 @@ ssize_t posix_host_io(
             // Limit transfer size to bounce buffer capacity
             bytes_requested = std::min(bytes_requested, bounce_buffer.size());
 
+            KVIKIO_NVTX_SCOPED_RANGE("Direct I/O + memcpy", bytes_requested, color_dio_memcpy);
+
             if constexpr (Operation == IOOperationType::WRITE) {
               // Copy user data to aligned bounce buffer before Direct I/O write
               std::memcpy(aligned_buf, buffer, bytes_requested);
@@ -131,6 +139,7 @@ ssize_t posix_host_io(
               std::memcpy(buffer, aligned_buf, nbytes_processed);
             }
           } else {
+            KVIKIO_NVTX_SCOPED_RANGE("Direct I/O", bytes_requested, color_dio);
             // Buffer is page-aligned: perform Direct I/O directly with user buffer
             nbytes_processed = pread_or_write(fd_direct_on, buffer, bytes_requested, cur_offset);
           }
@@ -193,30 +202,30 @@ std::size_t posix_device_io(int fd_direct_off,
 {
   // Direct I/O requires page-aligned bounce buffers. CudaPinnedBounceBufferPool uses
   // cudaMemHostAlloc which does not guarantee page alignment.
-  if (std::is_same_v<BounceBufferPoolType, CudaPinnedBounceBufferPool>) {
+  if constexpr (std::is_same_v<BounceBufferPoolType, CudaPinnedBounceBufferPool>) {
     KVIKIO_EXPECT(
       fd_direct_on == -1,
       "Direct I/O requires page-aligned bounce buffers. CudaPinnedBounceBufferPool does not "
       "guarantee page alignment. Use CudaPageAlignedPinnedBounceBufferPool instead.");
   }
 
-  auto bounce_buffer      = BounceBufferPoolType::instance().get();
-  CUdeviceptr devPtr      = convert_void2deviceptr(devPtr_base) + devPtr_offset;
-  off_t cur_file_offset   = convert_size2off(file_offset);
-  off_t bytes_remaining   = convert_size2off(size);
-  off_t const chunk_size2 = convert_size2off(bounce_buffer.size());
+  auto bounce_buffer             = BounceBufferPoolType::instance().get();
+  CUdeviceptr devPtr             = convert_void2deviceptr(devPtr_base) + devPtr_offset;
+  off_t cur_file_offset          = convert_size2off(file_offset);
+  off_t bytes_remaining          = convert_size2off(size);
+  off_t const bounce_buffer_size = convert_size2off(bounce_buffer.size());
 
   // Get a stream for the current CUDA context and thread
   CUstream stream = StreamCachePerThreadAndContext::get();
 
   while (bytes_remaining > 0) {
-    off_t const nbytes_requested = std::min(chunk_size2, bytes_remaining);
-    ssize_t nbytes_got           = nbytes_requested;
+    off_t const nbytes_requested = std::min(bounce_buffer_size, bytes_remaining);
+    ssize_t nbytes_io            = nbytes_requested;
     if constexpr (Operation == IOOperationType::READ) {
-      nbytes_got = posix_host_io<IOOperationType::READ, PartialIO::YES>(
+      nbytes_io = posix_host_io<IOOperationType::READ, PartialIO::YES>(
         fd_direct_off, bounce_buffer.get(), nbytes_requested, cur_file_offset, fd_direct_on);
       CUDA_DRIVER_TRY(
-        cudaAPI::instance().MemcpyHtoDAsync(devPtr, bounce_buffer.get(), nbytes_got, stream));
+        cudaAPI::instance().MemcpyHtoDAsync(devPtr, bounce_buffer.get(), nbytes_io, stream));
       CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
     } else {  // Is a write operation
       CUDA_DRIVER_TRY(
@@ -225,12 +234,18 @@ std::size_t posix_device_io(int fd_direct_off,
       posix_host_io<IOOperationType::WRITE, PartialIO::NO>(
         fd_direct_off, bounce_buffer.get(), nbytes_requested, cur_file_offset, fd_direct_on);
     }
-    cur_file_offset += nbytes_got;
-    devPtr += nbytes_got;
-    bytes_remaining -= nbytes_got;
+    cur_file_offset += nbytes_io;
+    devPtr += nbytes_io;
+    bytes_remaining -= nbytes_io;
   }
   return size;
 }
+
+std::size_t posix_device_read_aligned(int fd_direct_on,
+                                      void const* devPtr_base,
+                                      std::size_t size,
+                                      std::size_t file_offset,
+                                      std::size_t devPtr_offset);
 
 /**
  * @brief Read from disk to host memory using POSIX
