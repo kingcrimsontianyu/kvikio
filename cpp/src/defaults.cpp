@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -69,6 +69,7 @@ RemoteIOBackend getenv_or(std::string_view env_var_name, RemoteIOBackend default
   auto const normalized = detail::normalize_env_value(env_val);
   if (normalized == "easy_threadpool") { return RemoteIOBackend::EASY_THREADPOOL; }
   if (normalized == "multi_poll") { return RemoteIOBackend::MULTI_POLL; }
+  if (normalized == "multi_socket") { return RemoteIOBackend::MULTI_SOCKET; }
   KVIKIO_FAIL("unknown config value " + std::string{env_var_name} + "=" + std::string{env_val},
               std::invalid_argument);
 }

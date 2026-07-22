@@ -21,6 +21,7 @@
 #include <kvikio/detail/env.hpp>
 #include <kvikio/detail/io_event_barrier.hpp>
 #include <kvikio/detail/multi_poll_reactor.hpp>
+#include <kvikio/detail/multi_socket_reactor.hpp>
 #include <kvikio/detail/nvtx.hpp>
 #include <kvikio/detail/parallel_operation.hpp>
 #include <kvikio/detail/remote_callback.hpp>
@@ -838,22 +839,26 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   }
 
   KVIKIO_EXPECT(
-    io_backend == RemoteIOBackend::MULTI_POLL, "Unknown RemoteIOBackend value", std::runtime_error);
+    io_backend == RemoteIOBackend::MULTI_POLL || io_backend == RemoteIOBackend::MULTI_SOCKET,
+    "Unknown RemoteIOBackend value",
+    std::runtime_error);
 
-  // MULTI_POLL path. The lifecycle of one pread() call uses four cooperating pieces:
+  // Multi-handle path (MULTI_POLL and MULTI_SOCKET). The lifecycle of one pread() call uses four
+  // cooperating pieces:
   // - One `RemoteMultiAggregateContext` per pread(). It owns the std::promise that the
   //   caller will observe and counts down as completions arrive.
   // - N `RemoteMultiTransfer` objects, one per sub-range. Each owns its own `CurlHandle`
   //   (a libcurl easy handle wrapper) plus a per-transfer `CallbackContext`, and holds a
   //   shared_ptr back to the aggregate.
-  // - The `MultiReactorPool` routes the N transfers to one or more `MultiPollReactor`
-  //   threads per the captured dispatch policy. Each reactor drives its easy handles via
-  //   curl_multi_poll() and fires the aggregate's per-subrange callback on completion or
-  //   failure.
+  // - A reactor pool routes the N transfers to one or more reactor threads per the captured
+  //   dispatch policy. Each reactor drives its easy handles (via curl_multi_poll() for MULTI_POLL,
+  //   or curl_multi_socket_action() + epoll for MULTI_SOCKET) and fires the aggregate's
+  //   per-subrange callback on completion or failure.
   // - The aggregate fulfills the promise as soon as all sub-ranges have reported (or one
   //   of them fails).
   //
-  // Build all N transfers here, then hand them off in a single pool call.
+  // The transfer building below is identical for both multi backends. Only the pool the transfers
+  // are submitted to differs. Build all N transfers here, then hand them off in a single pool call.
   KVIKIO_EXPECT(task_size > 0, "`task_size` must be positive", std::invalid_argument);
   if (file_offset + size > _nbytes) {
     std::stringstream ss;
@@ -916,7 +921,11 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   }
 
   // One pool call per pread(). The pool consults the captured dispatch policy internally.
-  detail::MultiReactorPool::instance().submit_pread(std::move(transfers));
+  if (io_backend == RemoteIOBackend::MULTI_SOCKET) {
+    detail::MultiSocketReactorPool::instance().submit_pread(std::move(transfers));
+  } else {
+    detail::MultiReactorPool::instance().submit_pread(std::move(transfers));
+  }
 
   if (is_host_mem) { return fut; }
 

@@ -191,6 +191,8 @@ if(KvikIO_REMOTE_SUPPORT)
     "src/hdfs.cpp"
     "src/remote_handle.cpp"
     "src/detail/multi_poll_reactor.cpp"
+    "src/detail/multi_socket_reactor.cpp"
+    "src/detail/remote_multi_transfer.cpp"
     "src/detail/remote_callback.cpp"
     "src/detail/tls.cpp"
     "src/detail/url.cpp"

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -63,6 +63,12 @@ enum class RemoteIOBackend : uint8_t {
         ///< `curl_multi_poll()`. A single reactor multiplexes many in-flight easy handles
         ///< concurrently, so the number of simultaneous transfers is not bounded by the reactor
         ///< count. See `KVIKIO_REMOTE_IO_NUM_REACTORS` and `KVIKIO_REMOTE_IO_REACTOR_DISPATCH`.
+  MULTI_SOCKET =
+    2,  ///< Libcurl multi socket API (`curl_multi_socket_action()`) driven by N reactor threads,
+        ///< each blocking in `epoll_wait()` on a persistent epoll set. Same execution model and
+        ///< tuning knobs as `MULTI_POLL`, but libcurl pushes socket-interest changes to the reactor
+        ///< instead of the reactor rebuilding an fd set every iteration. See
+        ///< `KVIKIO_REMOTE_IO_NUM_REACTORS` and `KVIKIO_REMOTE_IO_REACTOR_DISPATCH`.
 };
 
 /**
