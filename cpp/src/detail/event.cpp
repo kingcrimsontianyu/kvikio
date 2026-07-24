@@ -80,10 +80,13 @@ CudaEventPool::CudaEvent CudaEventPool::get()
   KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().CtxGetCurrent(&ctx));
   KVIKIO_EXPECT(ctx != nullptr, "No CUDA context is current");
 
+  // When KVIKIO_TEST_NO_EVENT_POOL=1, bypass the cache and always create a fresh event so we can
+  // measure cuEventCreate/cuEventDestroy overhead vs pool reuse.
+  static bool const bypass_pool = (std::getenv("KVIKIO_TEST_NO_EVENT_POOL") != nullptr);
+
   CUevent event{};
-  {
+  if (!bypass_pool) {
     std::lock_guard const lock(_mutex);
-    // If the key (`ctx`) is found from the pool, assign the search result to `event`
     if (auto it = _pools.find(ctx); it != _pools.end() && !it->second.empty()) {
       event = it->second.back();
       it->second.pop_back();
@@ -91,9 +94,6 @@ CudaEventPool::CudaEvent CudaEventPool::get()
   }
 
   if (event == nullptr) {
-    // Create an event outside the lock to improve performance. The pool is not updated here. The
-    // returned CudaEvent object will automatically return the event to the pool when it goes out
-    // of scope
     KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().EventCreate(&event, CU_EVENT_DISABLE_TIMING));
   }
 
@@ -105,17 +105,26 @@ void CudaEventPool::put(CUevent event, CUcontext cuda_context) noexcept
   KVIKIO_NVTX_FUNC_RANGE();
   if (event == nullptr) { return; }
 
-  try {
-    std::lock_guard const lock(_mutex);
-    _pools[cuda_context].push_back(event);
-  } catch (std::exception const& e) {
-    // push_back can throw on allocator failure (e.g., out-of-memory). The event cannot stay
-    // cached, so destroy it to release its CUDA resources.
-    KVIKIO_LOG_ERROR(e.what());
+  static bool const bypass_pool = (std::getenv("KVIKIO_TEST_NO_EVENT_POOL") != nullptr);
+
+  if (bypass_pool) {
     try {
       KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().EventDestroy(event));
     } catch (std::exception const& e) {
       KVIKIO_LOG_ERROR(e.what());
+    }
+    return;
+  }
+
+  try {
+    std::lock_guard const lock(_mutex);
+    _pools[cuda_context].push_back(event);
+  } catch (std::exception const& e) {
+    KVIKIO_LOG_ERROR(e.what());
+    try {
+      KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().EventDestroy(event));
+    } catch (std::exception const& e2) {
+      KVIKIO_LOG_ERROR(e2.what());
     }
   }
 }
