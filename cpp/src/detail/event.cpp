@@ -108,11 +108,12 @@ void CudaEventPool::put(CUevent event, CUcontext cuda_context) noexcept
   static bool const bypass_pool = (std::getenv("KVIKIO_TEST_NO_EVENT_POOL") != nullptr);
 
   if (bypass_pool) {
-    try {
-      KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().EventDestroy(event));
-    } catch (std::exception const& e) {
-      KVIKIO_LOG_ERROR(e.what());
-    }
+    // TEST BRANCH: intentionally leak the event handle rather than calling cuEventDestroy.
+    // put() is called from ~CudaEvent(), which may run on a CUDA driver thread (via the
+    // cuLaunchHostFunc recycle callback chain). cuEventDestroy is a CUDA API call and is
+    // prohibited inside cuLaunchHostFunc callbacks. Pool mode avoids this by doing only
+    // push_back here; bypass mode matches that by also skipping the CUDA call. Leaking
+    // the handles is acceptable for a short-lived throughput experiment.
     return;
   }
 
