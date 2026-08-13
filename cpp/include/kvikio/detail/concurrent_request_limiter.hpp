@@ -102,6 +102,17 @@ class ConcurrentRequestLimiter {
    */
   [[nodiscard]] bool unlimited() const noexcept;
 
+  /**
+   * @brief Number of slots that `try_acquire()` could currently hand out.
+   *
+   * Advisory only: with concurrent acquirers the true figure may have changed by the time the
+   * caller acts on it. The reactor uses it to size how much work to pull from the pool's shared
+   * queue, where over- or under-estimating costs at most one loop iteration.
+   *
+   * @return The free slot count, or `std::nullopt` when the limiter is unlimited.
+   */
+  [[nodiscard]] std::optional<std::size_t> available() const noexcept;
+
  private:
   /**
    * @brief Return one previously reserved slot. Called by `Slot` only, which guarantees the

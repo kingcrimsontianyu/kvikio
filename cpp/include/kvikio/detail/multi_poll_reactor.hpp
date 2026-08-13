@@ -267,9 +267,10 @@ class MultiPollReactor {
  * `KVIKIO_REMOTE_IO_REACTOR_DISPATCH` env vars.
  *
  * Dispatch rules (with `N = _reactors.size()`):
- *  - `PER_CHUNK` (default): each sub-range is routed independently via a round-robin atomic
- *    counter. Maximizes load distribution. May cause sub-ranges of the same file to use distinct
- *    TCP/TLS connections.
+ *  - `PER_CHUNK` (default): sub-ranges go into one shared queue that every reactor pulls from as
+ *    its own concurrency slots free up. Load balances itself, so a reactor that draws slow requests
+ *    does not hold back the whole `pread()` while its peers sit idle. May cause sub-ranges of the
+ *    same file to use distinct TCP/TLS connections.
  *  - `PER_PREAD`: all sub-ranges of one `submit_pread()` call land on the same reactor (round-robin
  *    per call). Preserves per-`CURLM` connection-pool reuse.
  */
@@ -328,13 +329,52 @@ class MultiReactorPool {
    */
   void signal_death(std::exception_ptr eptr) noexcept;
 
+  /**
+   * @brief Move up to `max_count` transfers out of the shared queue. Thread-safe.
+   *
+   * Called by a reactor at the top of its loop with however many concurrency slots it currently has
+   * free, so work lands on whichever reactor is ready to run it.
+   *
+   * @param out Destination the transfers are appended to.
+   * @param max_count Upper bound on how many to take. `std::nullopt` means take everything queued.
+   * @return Number of transfers moved.
+   */
+  std::size_t pull_shared(std::deque<std::unique_ptr<RemoteMultiTransfer>>& out,
+                          std::optional<std::size_t> max_count);
+
+  /**
+   * @brief Whether the shared queue currently holds any work. Thread-safe.
+   *
+   * Advisory: used by a reactor to decide whether to poll with a zero timeout.
+   */
+  [[nodiscard]] bool has_shared_work() const noexcept;
+
  private:
   MultiReactorPool();
   ~MultiReactorPool() noexcept;
 
+  /**
+   * @brief Resolve every transfer still sitting in the shared queue with `eptr`.
+   *
+   * Called by each reactor on its way out after pool death. The first caller empties the queue and
+   * the rest find it empty.
+   */
+  void drain_shared_and_fail(std::exception_ptr eptr) noexcept;
+
+  friend class MultiPollReactor;
+
   std::vector<std::unique_ptr<MultiPollReactor>> _reactors;
+  // Work pool for PER_CHUNK dispatch. Reactors pull from here instead of being assigned a fixed
+  // share up front.
+  std::mutex _shared_inbox_mutex;
+  std::deque<std::unique_ptr<RemoteMultiTransfer>> _shared_inbox;
+  // Mirrors `_shared_inbox.size()`, maintained under `_shared_inbox_mutex`. Every reactor probes
+  // the queue on every loop iteration, so the probe reads this instead of taking the lock. A stale
+  // read costs at most one extra loop iteration.
+  std::atomic<std::size_t> _shared_inbox_size{0};
   RemoteReactorDispatch _dispatch;
-  // Round-robin counter. Incremented per pread (PER_PREAD) or per chunk (PER_CHUNK).
+  // Round-robin counter, incremented once per pread. Used only by PER_PREAD; under PER_CHUNK the
+  // reactor is not chosen at submit time, it is whichever one pulls the sub-range off the queue.
   std::atomic<std::size_t> _next_reactor_counter{0};
   std::atomic<bool> _dead{false};
   std::mutex mutable _death_mutex;  // Protects writes to `_death_reason`.

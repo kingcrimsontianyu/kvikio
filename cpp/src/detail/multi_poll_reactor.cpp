@@ -136,6 +136,33 @@ MultiPollReactor::MultiPollReactor(MultiReactorPool* pool,
   std::ignore = LibCurl::instance();
   _curl_multi = curl_multi_init();
   KVIKIO_EXPECT(_curl_multi != nullptr, "curl_multi_init() failed", std::runtime_error);
+
+  // Size the multi handle's connection cache. Left unset, libcurl derives the limit from the number
+  // of easy handles currently attached (4x), so it collapses as a pread drains and evicts live
+  // connections the next pread would have reused.
+  //
+  // The cache counts in-use connections as well as idle ones, so sizing it at exactly this
+  // reactor's request ceiling still evicts: the moment one transfer finishes while its peers are
+  // still running, the freed connection pushes the count past the limit. The headroom factor keeps
+  // a full ceiling's worth of idle connections available for reuse. Re-establishing one is not
+  // merely the cost of a handshake; a dropped SYN under load costs a full 1s TCP retransmit
+  // timeout, which shows up as a straggler that holds up the entire pread.
+  //
+  // With no ceiling there is nothing to derive a size from, so libcurl's default is left in place.
+  {
+    // Idle connections to keep cached per in-flight request slot.
+    constexpr long connection_cache_headroom = 2;
+    if (max_concurrent_requests.has_value()) {
+      auto const cache_size =
+        static_cast<long>(max_concurrent_requests.value()) * connection_cache_headroom;
+      auto const mc = curl_multi_setopt(_curl_multi, CURLMOPT_MAXCONNECTS, cache_size);
+      KVIKIO_EXPECT(
+        mc == CURLM_OK,
+        std::string("curl_multi_setopt(CURLMOPT_MAXCONNECTS): ") + curl_multi_strerror(mc),
+        std::runtime_error);
+    }
+  }
+
   _io_thread = std::thread(&MultiPollReactor::io_thread_main, this);
 }
 
@@ -190,6 +217,19 @@ void MultiPollReactor::io_thread_main()
             _inbox.pop_front();
           }
         }
+      }
+
+      // Stage (1b): Top up from the pool's shared queue, taking only what this reactor could admit
+      // right now. Anything already in `_pending` is competing for the same slots, so it counts
+      // against the request. Leaving the rest queued is what lets a reactor that drains early pick
+      // up the slack from a slower peer.
+      {
+        auto const free_slots = _request_limiter.available();
+        std::optional<std::size_t> want;
+        if (free_slots.has_value()) {
+          want = (free_slots.value() > _pending.size()) ? free_slots.value() - _pending.size() : 0;
+        }
+        _pool->pull_shared(_pending, want);
       }
 
       // Iterate the per-reactor _pending: Each entry is either admitted to libcurl or moved to
@@ -378,7 +418,13 @@ void MultiPollReactor::io_thread_main()
       constexpr int idle_timeout_ms = 1000;
       constexpr int busy_timeout_ms = 10;
       int poll_timeout_ms{};
-      if (_pending.empty()) {
+      // Slots freed during stage (3) may now cover work still sitting in the shared queue, so come
+      // straight back around and pull it rather than waiting on a socket.
+      bool const shared_work_admissible =
+        _request_limiter.available().value_or(1) > _pending.size() && _pool->has_shared_work();
+      if (shared_work_admissible) {
+        poll_timeout_ms = 0;
+      } else if (_pending.empty()) {
         // Nothing queued
         poll_timeout_ms = idle_timeout_ms;
       } else if (!deferred_for_resource && earliest_ready_at.has_value()) {
@@ -449,6 +495,10 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
 
 void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
 {
+  // Work parked in the pool's shared queue belongs to no single reactor, so whichever reactor gets
+  // here first resolves it. The rest find the queue already empty.
+  _pool->drain_shared_and_fail(eptr);
+
   // Drain the inbox under the submit mutex.
   {
     std::lock_guard<std::mutex> const lock(_submit_mutex);
@@ -515,14 +565,67 @@ void MultiReactorPool::submit_pread(std::vector<std::unique_ptr<RemoteMultiTrans
     return;
   }
 
-  // PER_CHUNK: round-robin sub-ranges across reactors.
-  std::vector<std::vector<std::unique_ptr<RemoteMultiTransfer>>> buckets(reactor_count);
-  for (auto& transfer : transfers) {
-    auto const idx = _next_reactor_counter.fetch_add(1, std::memory_order_relaxed) % reactor_count;
-    buckets[idx].push_back(std::move(transfer));
+  // PER_CHUNK: park every sub-range in the shared queue and let reactors take work as they free up
+  // slots. Pre-assigning a fixed share to each reactor instead would let one reactor that drew slow
+  // requests stretch the whole pread while its peers idle with empty queues.
+  std::exception_ptr fail_reason;
+  {
+    std::lock_guard<std::mutex> const lock(_shared_inbox_mutex);
+    if (is_dead()) {
+      fail_reason = death_reason();
+    } else {
+      for (auto& transfer : transfers) {
+        _shared_inbox.push_back(std::move(transfer));
+      }
+      _shared_inbox_size.store(_shared_inbox.size(), std::memory_order_relaxed);
+    }
   }
-  for (std::size_t i = 0; i < reactor_count; ++i) {
-    if (!buckets[i].empty()) { _reactors[i]->submit(std::move(buckets[i])); }
+  if (fail_reason) {
+    for (auto& transfer : transfers) {
+      transfer->aggregate->on_subrange_failed(fail_reason);
+    }
+    return;
+  }
+  // Wake every reactor: any of them may be the one with a free slot.
+  for (auto const& reactor : _reactors) {
+    reactor->wakeup();
+  }
+}
+
+std::size_t MultiReactorPool::pull_shared(std::deque<std::unique_ptr<RemoteMultiTransfer>>& out,
+                                          std::optional<std::size_t> max_count)
+{
+  if (max_count.has_value() && max_count.value() == 0) { return 0; }
+  // Cheap unlocked reject so idle reactors do not serialize on the mutex.
+  if (_shared_inbox_size.load(std::memory_order_relaxed) == 0) { return 0; }
+  std::lock_guard<std::mutex> const lock(_shared_inbox_mutex);
+  auto const queued   = _shared_inbox.size();
+  std::size_t const n = max_count.has_value() ? std::min(max_count.value(), queued) : queued;
+  for (std::size_t i = 0; i < n; ++i) {
+    out.push_back(std::move(_shared_inbox.front()));
+    _shared_inbox.pop_front();
+  }
+  _shared_inbox_size.store(_shared_inbox.size(), std::memory_order_relaxed);
+  return n;
+}
+
+bool MultiReactorPool::has_shared_work() const noexcept
+{
+  return _shared_inbox_size.load(std::memory_order_relaxed) > 0;
+}
+
+void MultiReactorPool::drain_shared_and_fail(std::exception_ptr eptr) noexcept
+{
+  std::deque<std::unique_ptr<RemoteMultiTransfer>> stranded;
+  {
+    std::lock_guard<std::mutex> const lock(_shared_inbox_mutex);
+    std::swap(stranded, _shared_inbox);
+    _shared_inbox_size.store(0, std::memory_order_relaxed);
+  }
+  // Resolve outside the lock: on_subrange_failed may fulfill a promise and run continuations.
+  while (!stranded.empty()) {
+    stranded.front()->aggregate->on_subrange_failed(eptr);
+    stranded.pop_front();
   }
 }
 

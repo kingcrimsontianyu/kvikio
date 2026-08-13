@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -73,11 +73,12 @@ enum class RemoteIOBackend : uint8_t {
  * equivalent.
  */
 enum class RemoteReactorDispatch : uint8_t {
-  PER_CHUNK =
-    0,  ///< Sub-ranges are routed to reactors round-robin, independently of which `pread()` they
-        ///< belong to. This maximizes load balance across reactors. Trade-off: two sub-ranges of
-        ///< the same file may land on different reactors, each with its own libcurl connection
-        ///< cache, so they may not share an established TCP/TLS connection.
+  PER_CHUNK = 0,  ///< Each sub-range is placed on a reactor independently of which `pread()` it
+                  ///< belongs to. Sub-ranges wait in a queue shared by all reactors, and a reactor
+                  ///< takes one whenever it has a free in-flight slot, so load balances itself
+                  ///< rather than being fixed at submit time. Trade-off: two sub-ranges of the same
+                  ///< file may land on different reactors, each with its own libcurl connection
+                  ///< cache, so they may not share an established TCP/TLS connection.
   PER_PREAD =
     1,  ///< All sub-ranges of a single `pread()` are submitted to the same reactor (the reactor is
         ///< itself chosen round-robin per `pread()` call). The sub-ranges then share that reactor's

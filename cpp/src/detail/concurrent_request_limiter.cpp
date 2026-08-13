@@ -84,4 +84,12 @@ bool ConcurrentRequestLimiter::unlimited() const noexcept
   return !_max_concurrent_requests.has_value();
 }
 
+std::optional<std::size_t> ConcurrentRequestLimiter::available() const noexcept
+{
+  if (!_max_concurrent_requests.has_value()) { return std::nullopt; }
+  auto const cur = _count.load(std::memory_order_relaxed);
+  auto const max = _max_concurrent_requests.value();
+  return (cur >= max) ? 0 : max - cur;
+}
+
 }  // namespace kvikio::detail

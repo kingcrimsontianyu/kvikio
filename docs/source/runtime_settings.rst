@@ -91,7 +91,7 @@ Remote I/O Reactor Dispatch ``KVIKIO_REMOTE_IO_REACTOR_DISPATCH``
 
 Controls how the sub-ranges of a single :py:func:`kvikio.RemoteFile.pread` are distributed across reactor threads when ``MULTI_POLL`` is active. When only one reactor is used, both modes are equivalent. This setting has no effect under ``EASY_THREADPOOL``. The accepted values (case-insensitive) are:
 
-  * ``PER_CHUNK`` (default): Sub-ranges are routed to reactors round-robin, independently of which :py:func:`kvikio.RemoteFile.pread` they belong to. This maximizes load balance across reactors. Trade-off: two sub-ranges of the same file may land on different reactors, each with its own libcurl connection cache, so they may not share an established TCP/TLS connection.
+  * ``PER_CHUNK`` (default): Sub-ranges are placed in a queue shared by all reactors, independently of which :py:func:`kvikio.RemoteFile.pread` they belong to. Each reactor pulls from that queue as its own in-flight slots free up, so a reactor that draws slow requests does not hold back the read while its peers sit idle. Trade-off: two sub-ranges of the same file may land on different reactors, each with its own libcurl connection cache, so they may not share an established TCP/TLS connection.
   * ``PER_PREAD``: All sub-ranges of a single :py:func:`kvikio.RemoteFile.pread` are submitted to the same reactor (the reactor is itself chosen round-robin per :py:func:`kvikio.RemoteFile.pread` call). The sub-ranges then share that reactor's libcurl connection cache, allowing an established TCP/TLS connection to be reused. Best for HTTPS, where the TLS handshake cost is non-trivial.
 
 Remote I/O Concurrency Cap ``KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS``
@@ -102,6 +102,8 @@ Upper bound on the number of HTTP range requests the ``MULTI_POLL`` backend keep
 The global budget is divided into an equal private share per reactor (``KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS`` divided by ``KVIKIO_REMOTE_IO_NUM_REACTORS``), so each reactor enforces its own cap against its own inbox with no cross-reactor synchronization. Integer division rounds the per-reactor share down when the budget is not a multiple of the reactor count, and a floor of 1 rounds it up when the budget is smaller than the reactor count (a computed share of 0 would be a reactor that can never admit a request). The effective total is therefore only approximate.
 
 The even split assumes sub-ranges are spread across reactors, which holds under ``PER_CHUNK``. Under ``PER_PREAD`` all sub-ranges of one large :py:func:`kvikio.RemoteFile.pread` land on a single reactor, so that read is effectively limited to one reactor's share while the others stay idle.
+
+Each reactor also sizes its libcurl connection cache (``CURLMOPT_MAXCONNECTS``) from its private share, with headroom so that a connection freed by a finishing transfer is not evicted while its peers are still running. Re-establishing an evicted connection costs more than a handshake: a dropped SYN under load stalls that request for a full TCP retransmit timeout, which delays the whole :py:func:`kvikio.RemoteFile.pread`.
 
 CA bundle file and CA directory ``CURL_CA_BUNDLE``, ``SSL_CERT_FILE``, ``SSL_CERT_DIR``
 ---------------------------------------------------------------------------------------
