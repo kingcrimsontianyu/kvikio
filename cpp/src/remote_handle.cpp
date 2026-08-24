@@ -18,6 +18,7 @@
 
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
+#include <kvikio/detail/curl_share.hpp>
 #include <kvikio/detail/env.hpp>
 #include <kvikio/detail/http_retry.hpp>
 #include <kvikio/detail/io_event_barrier.hpp>
@@ -969,6 +970,10 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
     transfer->curl                  = std::make_unique<CurlHandle>(LibCurl::instance().get_handle(),
                                                   detail::fix_conda_file_path_hack(__FILE__),
                                                   KVIKIO_STRINGIFY(__LINE__));
+    // Every reactor owns a separate multi handle and therefore a separate DNS cache. Point them
+    // all at one shared cache, so a hostname is resolved once for the process instead of once per
+    // reactor. See `CurlShare` for why the connection cache is deliberately not shared.
+    transfer->curl->setopt(CURLOPT_SHARE, detail::CurlShare::instance().handle());
     _endpoint->setopt(*transfer->curl);
     _endpoint->setup_range_request(*transfer->curl, cur_off, subrange_size);
     transfer->ctx.size     = subrange_size;
