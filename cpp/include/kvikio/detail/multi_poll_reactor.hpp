@@ -315,7 +315,7 @@ class MultiPollReactor {
  *  - `PER_CHUNK` (default): each sub-range is routed independently via a round-robin atomic
  *    counter. Maximizes load distribution. May cause sub-ranges of the same file to use distinct
  *    TCP/TLS connections.
- *  - `PER_PREAD`: all sub-ranges of one `submit_pread()` call land on the same reactor (round-robin
+ *  - `PER_PREAD`: all transfers of one `submit_transfers()` call land on the same reactor (round-
  *    per call). Preserves per-`CURLM` connection-pool reuse.
  */
 class MultiReactorPool {
@@ -336,16 +336,20 @@ class MultiReactorPool {
   MultiReactorPool& operator=(MultiReactorPool&&)      = delete;
 
   /**
-   * @brief Submit all sub-range transfers belonging to one `RemoteHandle::pread()` call.
+   * @brief Submit a group of transfers that should share a reactor under `PER_PREAD`.
    *
-   * Routes each transfer to a reactor according to the captured dispatch policy. The caller must
-   * have already obtained the aggregate future from the shared `RemoteMultiAggregateContext`
-   * before invoking this, because as soon as the pool returns the reactors may have already
-   * started completing the transfers.
+   * The caller must have already obtained every aggregate's future before invoking this, because
+   * as soon as the pool returns the reactors may have started completing the transfers.
    *
-   * @param transfers The sub-range transfers, ownership transferred to the pool.
+   * A batch read calls this once per file, so `PER_PREAD` gives each file its own reactor and its
+   * own connection cache.
+   *
+   * @param transfers The transfers, ownership transferred to the pool.
+   * @param dispatch Overrides `KVIKIO_REMOTE_IO_REACTOR_DISPATCH` for this call. Unset uses the
+   * policy captured at pool construction.
    */
-  void submit_pread(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers);
+  void submit_transfers(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers,
+                        std::optional<RemoteReactorDispatch> dispatch = std::nullopt);
 
   /**
    * @brief Whether the pool has been marked dead by a reactor that has caught a fatal libcurl

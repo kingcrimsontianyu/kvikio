@@ -12,9 +12,11 @@
 #include <iostream>
 #include <memory>
 #include <regex>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
@@ -27,6 +29,7 @@
 #include <kvikio/detail/parallel_operation.hpp>
 #include <kvikio/detail/remote_callback.hpp>
 #include <kvikio/detail/stream.hpp>
+#include <kvikio/detail/transfer_plan.hpp>
 #include <kvikio/detail/url.hpp>
 #include <kvikio/error.hpp>
 #include <kvikio/hdfs.hpp>
@@ -864,11 +867,40 @@ std::size_t RemoteHandle::read_impl(void* buf,
   return size;
 }
 
+std::unique_ptr<detail::RemoteMultiTransfer> RemoteHandle::make_transfer(std::size_t file_offset,
+                                                                         std::size_t size,
+                                                                         bool is_device)
+{
+  auto transfer  = std::make_unique<detail::RemoteMultiTransfer>();
+  transfer->curl = std::make_unique<CurlHandle>(LibCurl::instance().get_handle(),
+                                                detail::fix_conda_file_path_hack(__FILE__),
+                                                KVIKIO_STRINGIFY(__LINE__));
+  _endpoint->setopt(*transfer->curl);
+  _endpoint->setup_range_request(*transfer->curl, file_offset, size);
+  transfer->ctx.size  = size;
+  transfer->is_device = is_device;
+  auto* const write_callback =
+    is_device ? &detail::callback_pinned_buffer : &detail::callback_host_memory;
+  transfer->curl->setopt(CURLOPT_WRITEFUNCTION, write_callback);
+  transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
+  return transfer;
+}
+
 std::future<std::size_t> RemoteHandle::pread(void* buf,
                                              std::size_t size,
                                              std::size_t file_offset,
                                              std::size_t task_size,
                                              ThreadPool* thread_pool)
+{
+  return pread_impl(buf, size, file_offset, task_size, thread_pool, defaults::remote_io_backend());
+}
+
+std::future<std::size_t> RemoteHandle::pread_impl(void* buf,
+                                                  std::size_t size,
+                                                  std::size_t file_offset,
+                                                  std::size_t task_size,
+                                                  ThreadPool* thread_pool,
+                                                  RemoteIOBackend io_backend)
 {
   KVIKIO_NVTX_FUNC_RANGE(size);
 
@@ -877,7 +909,6 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
 
   detail::expect_not_in_monitor();
   bool const is_host_mem = is_host_memory(buf);
-  auto const io_backend  = defaults::remote_io_backend();
 
   // Everything that can reject the call is checked before the recorder exists, so a call that never
   // reaches the I/O is not observed. The bounds check above does the same.
@@ -965,26 +996,13 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   auto cur_buf          = static_cast<char*>(buf);
   for (std::size_t i = 0; i < num_subranges; ++i) {
     std::size_t const subrange_size = std::min(task_size, remaining);
-    auto transfer                   = std::make_unique<detail::RemoteMultiTransfer>();
-    transfer->curl                  = std::make_unique<CurlHandle>(LibCurl::instance().get_handle(),
-                                                  detail::fix_conda_file_path_hack(__FILE__),
-                                                  KVIKIO_STRINGIFY(__LINE__));
-    _endpoint->setopt(*transfer->curl);
-    _endpoint->setup_range_request(*transfer->curl, cur_off, subrange_size);
-    transfer->ctx.size     = subrange_size;
-    transfer->retry_policy = retry_policy;
+    auto transfer                   = make_transfer(cur_off, subrange_size, !is_host_mem);
+    transfer->retry_policy          = retry_policy;
     // One request and one destination covering the whole span. Only the batch API produces several.
     transfer->aggregates.push_back({.aggregate = aggregate, .bytes = subrange_size});
     transfer->ctx.segments.push_back(
       {.span_offset = 0, .length = subrange_size, .dst = cur_buf, .request_index = 0});
-    if (is_host_mem) {
-      transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_host_memory);
-    } else {
-      transfer->is_device  = true;
-      transfer->device_ctx = io_event_barrier->cuda_context();
-      transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_pinned_buffer);
-    }
-    transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
+    if (!is_host_mem) { transfer->device_ctx = io_event_barrier->cuda_context(); }
     transfers.push_back(std::move(transfer));
     cur_buf += subrange_size;
     cur_off += subrange_size;
@@ -992,7 +1010,7 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   }
 
   // One pool call per pread(). The pool consults the captured dispatch policy internally.
-  detail::MultiReactorPool::instance().submit_pread(std::move(transfers));
+  detail::MultiReactorPool::instance().submit_transfers(std::move(transfers));
 
   if (is_host_mem) { return fut; }
 
@@ -1002,6 +1020,189 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
                       io_event_barrier->sync_all_events();
                       return n;
                     });
+}
+
+namespace {
+
+// Names the offending request, so a rejected batch says which one was wrong.
+[[nodiscard]] std::string request_error(std::size_t index, std::string_view what)
+{
+  return "remote_batch_read: request " + std::to_string(index) + " " + std::string{what};
+}
+
+}  // namespace
+
+std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequest const> requests,
+                                                        RemoteBatchReadOptions const& opts)
+{
+  std::size_t total_bytes = 0;
+  for (auto const& request : requests) {
+    total_bytes += request.size;
+  }
+  KVIKIO_NVTX_FUNC_RANGE(total_bytes);
+
+  if (requests.empty()) { return {}; }
+  detail::expect_not_in_monitor();
+
+  auto const io_backend = opts.backend.value_or(defaults::remote_io_backend());
+  auto const task_size  = opts.task_size.value_or(defaults::task_size());
+  auto* const thread_pool =
+    (opts.thread_pool != nullptr) ? opts.thread_pool : &defaults::thread_pool();
+
+  // Naming a backend that cannot honor the other options is a contract error. Inheriting that
+  // backend from the process default is not, since the caller did not ask for the combination.
+  if (opts.backend == RemoteIOBackend::EASY_THREADPOOL) {
+    KVIKIO_EXPECT(!opts.coalesce_max_gap.has_value(),
+                  "remote_batch_read: EASY_THREADPOOL does not implement coalescing yet, so "
+                  "`backend` and `coalesce_max_gap` cannot both be honored",
+                  std::invalid_argument);
+    KVIKIO_EXPECT(!opts.dispatch.has_value(),
+                  "remote_batch_read: EASY_THREADPOOL has no reactors, so `dispatch` has no "
+                  "meaning there",
+                  std::invalid_argument);
+  } else if (io_backend == RemoteIOBackend::EASY_THREADPOOL &&
+             (opts.coalesce_max_gap.has_value() || opts.dispatch.has_value())) {
+    KVIKIO_LOG_DEBUG(
+      "remote_batch_read(): ignoring `coalesce_max_gap` and `dispatch`, since the "
+      "process default selected the EASY_THREADPOOL backend");
+  }
+
+  KVIKIO_EXPECT(task_size > 0, "`task_size` must be positive", std::invalid_argument);
+
+  // Validate the whole batch before submitting any of it. Throwing on request 500 after 499 are
+  // already running would strand in-flight work with no future to observe it.
+  bool any_device_destination = false;
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    auto const& request = requests[i];
+    KVIKIO_EXPECT(
+      request.handle != nullptr, request_error(i, "has a null handle"), std::invalid_argument);
+    if (request.size == 0) { continue; }
+    KVIKIO_EXPECT(
+      request.buf != nullptr, request_error(i, "has a null buffer"), std::invalid_argument);
+    KVIKIO_EXPECT(
+      !is_read_out_of_bounds(request.file_offset, request.size, request.handle->nbytes()),
+      request_error(i, "reads past the end of its file"),
+      std::invalid_argument);
+    if (!is_host_memory(request.buf)) { any_device_destination = true; }
+  }
+
+  if (io_backend == RemoteIOBackend::EASY_THREADPOOL) {
+    KVIKIO_EXPECT(thread_pool != nullptr, "The thread pool must not be nullptr");
+    std::vector<std::future<std::size_t>> futures;
+    futures.reserve(requests.size());
+    for (auto const& request : requests) {
+      futures.push_back(request.handle->pread_impl(
+        request.buf, request.size, request.file_offset, task_size, thread_pool, io_backend));
+    }
+    return futures;
+  }
+
+  KVIKIO_EXPECT(
+    io_backend == RemoteIOBackend::MULTI_POLL, "Unknown RemoteIOBackend value", std::runtime_error);
+  if (any_device_destination) {
+    KVIKIO_EXPECT(task_size <= defaults::bounce_buffer_size(),
+                  "MULTI_POLL backend with a device buffer requires task_size <= "
+                  "KVIKIO_BOUNCE_BUFFER_SIZE. Lower KVIKIO_TASK_SIZE or raise "
+                  "KVIKIO_BOUNCE_BUFFER_SIZE.",
+                  std::invalid_argument);
+  }
+
+  // The planner makes no CUDA calls, so the context of every device destination is resolved here.
+  std::vector<detail::TransferPlanRequest> plan_requests;
+  plan_requests.reserve(requests.size());
+  for (auto const& request : requests) {
+    CUcontext cuda_context = nullptr;
+    if (request.size > 0 && !is_host_memory(request.buf)) {
+      cuda_context = get_context_from_pointer(request.buf);
+    }
+    plan_requests.push_back({.handle       = request.handle,
+                             .cuda_context = cuda_context,
+                             .dst          = request.buf,
+                             .file_offset  = request.file_offset,
+                             .size         = request.size});
+  }
+
+  auto const plan = detail::build_transfer_plan(
+    plan_requests, {.task_size = task_size, .coalesce_max_gap = opts.coalesce_max_gap});
+
+  // Every future is taken before anything is submitted, because a reactor may complete a transfer
+  // as soon as it has been handed one.
+  std::vector<std::future<std::size_t>> futures(requests.size());
+  std::vector<std::shared_ptr<detail::RemoteMultiAggregateContext>> aggregates(requests.size());
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    auto const& request = requests[i];
+    if (request.size == 0) {
+      futures[i] = make_ready_future(static_cast<std::size_t>(0));
+      continue;
+    }
+
+    auto const cuda_context = plan_requests[i].cuda_context;
+    aggregates[i] =
+      std::make_shared<detail::RemoteMultiAggregateContext>(plan.transfers_per_request[i]);
+    if (detail::monitoring_enabled()) {
+      aggregates[i]->recorder = std::make_shared<detail::LogicalObservationRecorder>(
+        remote_io_backend_of(*request.handle->_endpoint),
+        TransferDirection::READ,
+        (cuda_context == nullptr) ? MemoryKind::HOST : MemoryKind::DEVICE,
+        request.file_offset,
+        request.size,
+        request.handle->_source,
+        "GET");
+    }
+
+    futures[i] = aggregates[i]->get_future();
+
+    // One barrier per request, so waiting on one future never waits on the whole batch.
+    if (cuda_context != nullptr) {
+      auto barrier                    = std::make_shared<detail::IoEventBarrier>(cuda_context);
+      aggregates[i]->io_event_barrier = barrier;
+      futures[i]                      = std::async(std::launch::deferred,
+                              [fut = std::move(futures[i]), barrier]() mutable -> std::size_t {
+                                auto const n = fut.get();
+                                barrier->sync_all_events();
+                                return n;
+                              });
+    }
+  }
+
+  auto const retry_policy = std::make_shared<detail::HttpRetryPolicy const>();
+  std::vector<std::unique_ptr<detail::RemoteMultiTransfer>> transfers;
+  transfers.reserve(plan.transfers.size());
+  for (auto const& planned : plan.transfers) {
+    bool const is_device = planned.cuda_context != nullptr;
+    auto transfer = planned.handle->make_transfer(planned.file_offset, planned.size, is_device);
+    transfer->retry_policy = retry_policy;
+    if (is_device) { transfer->device_ctx = planned.cuda_context; }
+    for (auto k = planned.segment_begin; k < planned.segment_end; ++k) {
+      auto const& segment = plan.segments[k];
+      transfer->ctx.segments.push_back(segment);
+      transfer->aggregates.push_back(
+        {.aggregate = aggregates[segment.request_index], .bytes = segment.length});
+    }
+    transfers.push_back(std::move(transfer));
+  }
+
+  // One pool call per group, so PER_PREAD gives each file its own reactor and connection cache.
+  // The planner emits a group's transfers contiguously, so one scan finds the boundaries.
+  auto& pool              = detail::MultiReactorPool::instance();
+  std::size_t group_begin = 0;
+  for (std::size_t i = 1; i <= plan.transfers.size(); ++i) {
+    bool const at_boundary =
+      (i == plan.transfers.size()) ||
+      plan.transfers[i].handle != plan.transfers[group_begin].handle ||
+      plan.transfers[i].cuda_context != plan.transfers[group_begin].cuda_context;
+    if (!at_boundary) { continue; }
+
+    std::vector<std::unique_ptr<detail::RemoteMultiTransfer>> group;
+    group.reserve(i - group_begin);
+    for (auto k = group_begin; k < i; ++k) {
+      group.push_back(std::move(transfers[k]));
+    }
+    pool.submit_transfers(std::move(group), opts.dispatch);
+    group_begin = i;
+  }
+
+  return futures;
 }
 
 }  // namespace kvikio

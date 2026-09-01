@@ -189,6 +189,113 @@ TEST_F(RemoteHandleTest, read_overflowing_range_throws_without_range_request)
   EXPECT_EQ(endpoint_ptr->range_request_calls, 0);
 }
 
+// A handle over the counting mock, so a rejected batch can be shown to have issued nothing.
+class BatchReadTest : public testing::Test {
+ protected:
+  kvikio::RemoteHandle make_handle()
+  {
+    auto endpoint = std::make_unique<CountingEndpoint>();
+    _endpoints.push_back(endpoint.get());
+    return kvikio::RemoteHandle{std::move(endpoint), endpoints().back()->file_size};
+  }
+
+  [[nodiscard]] std::vector<CountingEndpoint*> const& endpoints() const { return _endpoints; }
+
+  std::vector<char> _buffer = std::vector<char>(100);
+  std::vector<CountingEndpoint*> _endpoints;
+};
+
+TEST_F(BatchReadTest, empty_input_is_not_an_error)
+{
+  EXPECT_TRUE(kvikio::remote_batch_read({}).empty());
+}
+
+TEST_F(BatchReadTest, zero_size_request_is_ready)
+{
+  auto handle = make_handle();
+  std::vector<kvikio::RemoteReadRequest> requests{
+    {.handle = &handle, .buf = nullptr, .size = 0, .file_offset = 10}};
+
+  auto futures = kvikio::remote_batch_read(requests);
+  ASSERT_EQ(futures.size(), 1UL);
+  EXPECT_EQ(futures[0].get(), 0UL);
+  EXPECT_EQ(endpoints()[0]->range_request_calls, 0);
+}
+
+TEST_F(BatchReadTest, null_handle_names_its_index)
+{
+  auto handle = make_handle();
+  std::vector<kvikio::RemoteReadRequest> requests{
+    {.handle = &handle, .buf = _buffer.data(), .size = 10},
+    {.handle = nullptr, .buf = _buffer.data(), .size = 10}};
+
+  EXPECT_THAT([&] { kvikio::remote_batch_read(requests); },
+              ThrowsMessage<std::invalid_argument>(HasSubstr("request 1 has a null handle")));
+  EXPECT_EQ(endpoints()[0]->range_request_calls, 0) << "nothing may be issued before validating";
+}
+
+TEST_F(BatchReadTest, null_buffer_names_its_index)
+{
+  auto handle = make_handle();
+  std::vector<kvikio::RemoteReadRequest> requests{{.handle = &handle, .buf = nullptr, .size = 10}};
+
+  EXPECT_THAT([&] { kvikio::remote_batch_read(requests); },
+              ThrowsMessage<std::invalid_argument>(HasSubstr("request 0 has a null buffer")));
+  EXPECT_EQ(endpoints()[0]->range_request_calls, 0);
+}
+
+TEST_F(BatchReadTest, out_of_bounds_request_names_its_index)
+{
+  auto handle = make_handle();
+  std::vector<kvikio::RemoteReadRequest> requests{
+    {.handle = &handle, .buf = _buffer.data(), .size = 10},
+    {.handle = &handle, .buf = _buffer.data(), .size = 10, .file_offset = 95}};
+
+  EXPECT_THAT(
+    [&] { kvikio::remote_batch_read(requests); },
+    ThrowsMessage<std::invalid_argument>(HasSubstr("request 1 reads past the end of its file")));
+  EXPECT_EQ(endpoints()[0]->range_request_calls, 0);
+}
+
+TEST_F(BatchReadTest, naming_easy_backend_and_coalescing_together_throws)
+{
+  auto handle = make_handle();
+  std::vector<kvikio::RemoteReadRequest> requests{
+    {.handle = &handle, .buf = _buffer.data(), .size = 10}};
+
+  EXPECT_THAT(
+    [&] {
+      kvikio::remote_batch_read(
+        requests, {.backend = kvikio::RemoteIOBackend::EASY_THREADPOOL, .coalesce_max_gap = 64});
+    },
+    ThrowsMessage<std::invalid_argument>(HasSubstr("does not implement coalescing")));
+}
+
+TEST_F(BatchReadTest, naming_easy_backend_and_dispatch_together_throws)
+{
+  auto handle = make_handle();
+  std::vector<kvikio::RemoteReadRequest> requests{
+    {.handle = &handle, .buf = _buffer.data(), .size = 10}};
+
+  EXPECT_THAT(
+    [&] {
+      kvikio::remote_batch_read(requests,
+                                {.backend  = kvikio::RemoteIOBackend::EASY_THREADPOOL,
+                                 .dispatch = kvikio::RemoteReactorDispatch::PER_CHUNK});
+    },
+    ThrowsMessage<std::invalid_argument>(HasSubstr("has no reactors")));
+}
+
+TEST_F(BatchReadTest, zero_task_size_throws)
+{
+  auto handle = make_handle();
+  std::vector<kvikio::RemoteReadRequest> requests{
+    {.handle = &handle, .buf = _buffer.data(), .size = 10}};
+
+  EXPECT_THAT([&] { kvikio::remote_batch_read(requests, {.task_size = 0}); },
+              ThrowsMessage<std::invalid_argument>(HasSubstr("`task_size` must be positive")));
+}
+
 TEST_F(RemoteHandleTest, test_s3_url)
 {
   kvikio::test::EnvVarContext env_var_ctx{{"AWS_DEFAULT_REGION", "my_aws_default_region"},

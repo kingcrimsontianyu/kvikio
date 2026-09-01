@@ -583,12 +583,14 @@ MultiReactorPool& MultiReactorPool::instance()
   return *inst;
 }
 
-void MultiReactorPool::submit_pread(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers)
+void MultiReactorPool::submit_transfers(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers,
+                                        std::optional<RemoteReactorDispatch> dispatch)
 {
   auto const reactor_count = _reactors.size();
+  auto const policy        = dispatch.value_or(_dispatch);
 
-  // PER_PREAD: one reactor for the whole pread() call. Preserves per-CURLM connection-pool reuse.
-  if (_dispatch == RemoteReactorDispatch::PER_PREAD) {
+  // PER_PREAD: one reactor for this whole group. Preserves per-CURLM connection-pool reuse.
+  if (policy == RemoteReactorDispatch::PER_PREAD) {
     auto const idx = _next_reactor_counter.fetch_add(1, std::memory_order_relaxed) % reactor_count;
     _reactors[idx]->submit(std::move(transfers));
     return;
