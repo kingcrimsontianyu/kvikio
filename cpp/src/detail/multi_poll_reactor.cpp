@@ -71,6 +71,16 @@ CurlMultiAttachment& CurlMultiAttachment::operator=(CurlMultiAttachment&& other)
   return *this;
 }
 
+namespace {
+// Fail every request this transfer serves with the same exception.
+void fail_transfer(RemoteMultiTransfer& transfer, std::exception_ptr const& eptr) noexcept
+{
+  for (auto const& contribution : transfer.aggregates) {
+    contribution.aggregate->on_subrange_failed(eptr);
+  }
+}
+}  // namespace
+
 RemoteMultiTransfer::~RemoteMultiTransfer()
 {
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
@@ -208,7 +218,7 @@ void MultiPollReactor::submit(std::vector<std::unique_ptr<RemoteMultiTransfer>> 
   }
   if (fail_reason) {
     for (auto& transfer : transfers) {
-      transfer->aggregate->on_subrange_failed(fail_reason);
+      fail_transfer(*transfer, fail_reason);
     }
     return;
   }
@@ -306,8 +316,9 @@ void MultiPollReactor::io_thread_main()
           CURL* easy    = transfer->curl->handle();
           auto const mc = curl_multi_add_handle(_curl_multi, easy);
           if (mc != CURLM_OK) {
-            transfer->aggregate->on_subrange_failed(std::make_exception_ptr(std::runtime_error(
-              std::string("curl_multi_add_handle: ") + curl_multi_strerror(mc))));
+            fail_transfer(*transfer,
+                          std::make_exception_ptr(std::runtime_error(
+                            std::string("curl_multi_add_handle: ") + curl_multi_strerror(mc))));
             transfer.reset();
             KVIKIO_FAIL(std::string("curl_multi_add_handle: ") + curl_multi_strerror(mc),
                         std::runtime_error);
@@ -362,13 +373,34 @@ void MultiPollReactor::io_thread_main()
               // (thread, ctx) stream and hand the buffer to a cuLaunchHostFunc recycle callback so
               // the cache slot is returned when the H2D drains.
               PushAndPopContext c(transfer->device_ctx);
-              CUstream stream = StreamCachePerThreadAndContext::get();
-              KVIKIO_CUDA_DRIVER_TRY(
-                cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(transfer->device_dst),
-                                                    transfer->buffer.get(),
-                                                    transfer->ctx.size,
-                                                    stream));
-              transfer->aggregate->io_event_barrier->record_event(stream);
+              CUstream stream      = StreamCachePerThreadAndContext::get();
+              auto const& segments = transfer->ctx.segments;
+              auto* pinned         = static_cast<std::byte*>(transfer->buffer.get());
+              if (segments.size() == 1) {
+                // What every `pread()` sub-range looks like. One copy, as before.
+                KVIKIO_CUDA_DRIVER_TRY(
+                  cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(segments[0].dst),
+                                                      pinned + segments[0].span_offset,
+                                                      segments[0].length,
+                                                      stream));
+              } else {
+                // A coalesced span. Copy the wanted pieces and leave the holes behind.
+                std::vector<CUdeviceptr> dsts;
+                std::vector<CUdeviceptr> srcs;
+                std::vector<std::size_t> sizes;
+                dsts.reserve(segments.size());
+                srcs.reserve(segments.size());
+                sizes.reserve(segments.size());
+                for (auto const& segment : segments) {
+                  dsts.push_back(convert_void2deviceptr(segment.dst));
+                  srcs.push_back(convert_void2deviceptr(pinned + segment.span_offset));
+                  sizes.push_back(segment.length);
+                }
+                KVIKIO_CUDA_DRIVER_TRY(cudaAPI::cuda_memcpy_batch_async(dsts, srcs, sizes, stream));
+              }
+              for (auto const& contribution : transfer->aggregates) {
+                contribution.aggregate->io_event_barrier->record_event(stream);
+              }
               BounceBufferCache::instance().recycle_after(transfer->device_ctx,
                                                           std::move(transfer->buffer),
                                                           stream,
@@ -377,7 +409,9 @@ void MultiPollReactor::io_thread_main()
                                                               curl_multi_wakeup(curl_multi);
                                                           });
             }
-            transfer->aggregate->on_subrange_complete(transfer->ctx.size);
+            for (auto const& contribution : transfer->aggregates) {
+              contribution.aggregate->on_subrange_complete(contribution.bytes);
+            }
           } else if (transfer->ctx.overflow_error) {
             // Prefer the handle's recorded error buffer. Fall back to the generic strerror text
             // when libcurl recorded no message.
@@ -413,7 +447,7 @@ void MultiPollReactor::io_thread_main()
         } catch (...) {
           transfer_err = std::current_exception();
         }
-        if (transfer_err) { transfer->aggregate->on_subrange_failed(transfer_err); }
+        if (transfer_err) { fail_transfer(*transfer, transfer_err); }
       }
 
       // Stage (4): Wait for socket activity, a wakeup, a timeout, or elapsed backoff for retry.
@@ -467,8 +501,8 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
 {
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
 
-  // Extend the lifetime of aggregate (a shared pointer).
-  auto aggregate = transfer->aggregate;
+  // Extend the lifetime of the aggregates (shared pointers).
+  auto aggregates = transfer->aggregates;
 
   try {
     transfer->attachment.reset();
@@ -485,7 +519,10 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
     transfer->ready_at = ready_at;
     _pending.push_back(std::move(transfer));
   } catch (...) {
-    aggregate->on_subrange_failed(std::current_exception());
+    auto const eptr = std::current_exception();
+    for (auto const& contribution : aggregates) {
+      contribution.aggregate->on_subrange_failed(eptr);
+    }
   }
 }
 
@@ -497,7 +534,7 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
     while (!_inbox.empty()) {
       auto transfer = std::move(_inbox.front());
       _inbox.pop_front();
-      transfer->aggregate->on_subrange_failed(eptr);
+      fail_transfer(*transfer, eptr);
     }
   }
 
@@ -505,12 +542,12 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
   while (!_pending.empty()) {
     auto transfer = std::move(_pending.front());
     _pending.pop_front();
-    transfer->aggregate->on_subrange_failed(eptr);
+    fail_transfer(*transfer, eptr);
   }
 
   // In-flight is touched only by the I/O thread, which is us, so no lock needed.
   for (auto& in_flight_entry : _in_flight) {
-    in_flight_entry.second->aggregate->on_subrange_failed(eptr);
+    fail_transfer(*in_flight_entry.second, eptr);
   }
   _in_flight.clear();
 }

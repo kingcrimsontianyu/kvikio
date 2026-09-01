@@ -149,10 +149,21 @@ class CurlMultiAttachment {
 };
 
 /**
+ * @brief One request's share of a transfer, and how many of the span's bytes belong to it.
+ *
+ * A transfer that serves several merged requests holds one of these per request. On success each
+ * aggregate is told its own byte count, and on failure all of them get the same exception.
+ */
+struct AggregateContribution {
+  std::shared_ptr<RemoteMultiAggregateContext> aggregate;
+  std::size_t bytes;
+};
+
+/**
  * @brief Per-transfer state owned by a `MultiPollReactor` between submission and completion.
  *
  * One `RemoteMultiTransfer` corresponds to one libcurl easy handle, which corresponds to one HTTP
- * range request. Sub-ranges of the same `pread()` share the same `aggregate`. The `curl` member is
+ * range request. Sub-ranges of the same `pread()` share the same aggregate. The `curl` member is
  * held by `std::unique_ptr` because `CurlHandle` is intentionally non-movable.
  */
 struct RemoteMultiTransfer {
@@ -162,7 +173,9 @@ struct RemoteMultiTransfer {
   CurlMultiAttachment attachment;
 
   CallbackContext ctx;
-  std::shared_ptr<RemoteMultiAggregateContext> aggregate;
+
+  // One entry per request this transfer serves. `pread()` always has exactly one.
+  std::vector<AggregateContribution> aggregates;
 
   // Concurrency slot held from stage (1) admission until this transfer is destroyed after
   // completion or failure. Empty while the transfer waits in the inbox. Destroying the transfer
@@ -172,7 +185,6 @@ struct RemoteMultiTransfer {
   // Device-path fields. All zeroed/null for host transfers.
   bool is_device{false};
   CUcontext device_ctx{nullptr};
-  void* device_dst{nullptr};
   CudaPinnedBounceBufferPool::Buffer buffer{nullptr, nullptr, 0};
 
   // Retry bookkeeping. Number of attempts that have finished.

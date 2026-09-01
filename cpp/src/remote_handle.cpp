@@ -972,15 +972,16 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
     _endpoint->setopt(*transfer->curl);
     _endpoint->setup_range_request(*transfer->curl, cur_off, subrange_size);
     transfer->ctx.size     = subrange_size;
-    transfer->aggregate    = aggregate;
     transfer->retry_policy = retry_policy;
+    // One request and one destination covering the whole span. Only the batch API produces several.
+    transfer->aggregates.push_back({.aggregate = aggregate, .bytes = subrange_size});
+    transfer->ctx.segments.push_back(
+      {.span_offset = 0, .length = subrange_size, .dst = cur_buf, .request_index = 0});
     if (is_host_mem) {
-      transfer->ctx.buf = cur_buf;
       transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_host_memory);
     } else {
       transfer->is_device  = true;
       transfer->device_ctx = io_event_barrier->cuda_context();
-      transfer->device_dst = cur_buf;
       transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_pinned_buffer);
     }
     transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
