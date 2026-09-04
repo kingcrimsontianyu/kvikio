@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <curl/curl.h>
@@ -169,7 +170,11 @@ CurlHandle::CurlHandle(LibCurl::UniqueHandlePtr handle,
   detail::set_up_ca_paths(*this);
 }
 
-CurlHandle::~CurlHandle() noexcept { LibCurl::instance().retain_handle(std::move(_handle)); }
+CurlHandle::~CurlHandle() noexcept
+{
+  std::ignore = curl_easy_setopt(_handle.get(), CURLOPT_SHARE, static_cast<CURLSH*>(nullptr));
+  LibCurl::instance().retain_handle(std::move(_handle));
+}
 
 CURL* CurlHandle::handle() noexcept { return _handle.get(); }
 
