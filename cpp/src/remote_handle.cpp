@@ -131,7 +131,7 @@ class BounceBufferH2D {
       // optimize for this case.
       write_to_device(data, size);
     } else if (size > 0) {
-      std::memcpy(_host_buffer.get(_host_offset), data, size);
+      copy_chunk(static_cast<char*>(_host_buffer.get(_host_offset)), data, size);
       _host_offset += size;
     }
   }

@@ -100,6 +100,15 @@ void copy_nontemporal(char* dst, char const* src, std::size_t nbytes)
 
 }  // namespace
 
+void copy_chunk(char* dst, char const* src, std::size_t nbytes)
+{
+  if (nontemporal_copy_enabled()) {
+    copy_nontemporal(dst, src, nbytes);
+  } else {
+    std::memcpy(dst, src, nbytes);
+  }
+}
+
 void CallbackContext::reset_for_retry() noexcept
 {
   offset         = 0;
@@ -116,13 +125,7 @@ std::size_t callback_host_memory(char* data, std::size_t size, std::size_t nmemb
     return CURL_WRITEFUNC_ERROR;
   }
   KVIKIO_NVTX_FUNC_RANGE(nbytes);
-  if (!no_host_copy_enabled()) {
-    if (nontemporal_copy_enabled()) {
-      copy_nontemporal(ctx->buf + ctx->offset, data, nbytes);
-    } else {
-      std::memcpy(ctx->buf + ctx->offset, data, nbytes);
-    }
-  }
+  if (!no_host_copy_enabled()) { copy_chunk(ctx->buf + ctx->offset, data, nbytes); }
   ctx->offset += nbytes;
   return nbytes;
 }
@@ -137,7 +140,7 @@ std::size_t callback_pinned_buffer(char* data, std::size_t size, std::size_t nme
     return CURL_WRITEFUNC_ERROR;
   }
   KVIKIO_NVTX_FUNC_RANGE(nbytes);
-  std::memcpy(static_cast<char*>(ctx->pinned_buffer) + ctx->offset, data, nbytes);
+  copy_chunk(static_cast<char*>(ctx->pinned_buffer) + ctx->offset, data, nbytes);
   ctx->offset += nbytes;
   return nbytes;
 }
