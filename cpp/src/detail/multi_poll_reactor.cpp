@@ -78,7 +78,7 @@ namespace {
 void fail_transfer(RemoteMultiTransfer& transfer, std::exception_ptr const& eptr) noexcept
 {
   transfer.physical_recorder.reset();
-  for (auto const& contribution : transfer.aggregates) {
+  for (auto const& contribution : transfer.contributions) {
     contribution.aggregate->on_subrange_failed(eptr);
   }
 }
@@ -392,7 +392,7 @@ void MultiPollReactor::io_thread_main()
                                                       segments[0].length,
                                                       stream));
               } else {
-                // A coalesced span. Copy the wanted pieces and leave the holes behind.
+                // A coalesced span. Copy the wanted pieces and leave the gaps behind.
                 std::vector<CUdeviceptr> dsts;
                 std::vector<CUdeviceptr> srcs;
                 std::vector<std::size_t> sizes;
@@ -406,7 +406,7 @@ void MultiPollReactor::io_thread_main()
                 }
                 KVIKIO_CUDA_DRIVER_TRY(cudaAPI::cuda_memcpy_batch_async(dsts, srcs, sizes, stream));
               }
-              for (auto const& contribution : transfer->aggregates) {
+              for (auto const& contribution : transfer->contributions) {
                 contribution.aggregate->io_event_barrier->record_event(stream);
               }
               BounceBufferCache::instance().recycle_after(transfer->device_ctx,
@@ -419,7 +419,7 @@ void MultiPollReactor::io_thread_main()
             }
             // Before the aggregates, which may make the callers' futures ready.
             transfer->physical_recorder->finish(transfer->ctx.size);
-            for (auto const& contribution : transfer->aggregates) {
+            for (auto const& contribution : transfer->contributions) {
               contribution.aggregate->on_subrange_complete(contribution.bytes);
             }
           } else if (transfer->ctx.overflow_error) {
@@ -515,8 +515,8 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
 {
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
 
-  // Extend the lifetime of the aggregates (shared pointers).
-  auto aggregates = transfer->aggregates;
+  // Copy the contributions to keep the aggregates (shared pointers) alive after the move below.
+  auto contributions = transfer->contributions;
 
   try {
     transfer->attachment.reset();
@@ -534,7 +534,7 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
     _pending.push_back(std::move(transfer));
   } catch (...) {
     auto const eptr = std::current_exception();
-    for (auto const& contribution : aggregates) {
+    for (auto const& contribution : contributions) {
       contribution.aggregate->on_subrange_failed(eptr);
     }
   }

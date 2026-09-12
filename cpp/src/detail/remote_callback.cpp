@@ -19,7 +19,7 @@ void CallbackContext::reset_for_retry() noexcept
 {
   offset         = 0;
   overflow_error = false;
-  seg_idx        = 0;
+  segment_index  = 0;
 }
 
 std::size_t callback_host_memory(char* data, std::size_t size, std::size_t nmemb, void* context)
@@ -33,7 +33,7 @@ std::size_t callback_host_memory(char* data, std::size_t size, std::size_t nmemb
   }
   KVIKIO_NVTX_FUNC_RANGE(nbytes);
 
-  // Easy-backend path: the whole span goes to one buffer and there are no holes.
+  // Easy-backend path: the whole span goes to one buffer and there are no gaps.
   if (ctx->segments.empty()) {
     std::memcpy(ctx->buf + ctx->offset, data, nbytes);
     ctx->offset += nbytes;
@@ -43,11 +43,11 @@ std::size_t callback_host_memory(char* data, std::size_t size, std::size_t nmemb
   // `ctx->offset` is the position in the span, so it compares directly against `span_offset`.
   auto remaining = nbytes;
   auto* src      = data;
-  while (remaining > 0 && ctx->seg_idx < ctx->segments.size()) {
-    auto const& segment = ctx->segments[ctx->seg_idx];
+  while (remaining > 0 && ctx->segment_index < ctx->segments.size()) {
+    auto const& segment = ctx->segments[ctx->segment_index];
     auto const position = static_cast<std::size_t>(ctx->offset);
 
-    if (position < segment.span_offset) {  // In a hole. Advance without copying.
+    if (position < segment.span_offset) {  // In a gap. Advance without copying.
       auto const skipped = std::min(remaining, segment.span_offset - position);
       src += skipped;
       ctx->offset += static_cast<std::ptrdiff_t>(skipped);
@@ -61,7 +61,7 @@ std::size_t callback_host_memory(char* data, std::size_t size, std::size_t nmemb
     src += n;
     ctx->offset += static_cast<std::ptrdiff_t>(n);
     remaining -= n;
-    if (filled + n == segment.length) { ++ctx->seg_idx; }
+    if (filled + n == segment.length) { ++ctx->segment_index; }
   }
 
   // A span ends on wanted bytes, so nothing should be left. Count anything that is, to keep

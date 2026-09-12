@@ -39,7 +39,7 @@ struct CallbackContext {
    * @brief Where the received span goes, when it does not all go to one buffer.
    *
    * Empty means the whole span goes to `buf`, which is the easy-backend path. Otherwise the
-   * received bytes are scattered to the segments and the holes between them are dropped.
+   * received bytes are scattered to the segments and the gaps between them are dropped.
    */
   std::vector<TransferSegment> segments;
 
@@ -49,7 +49,7 @@ struct CallbackContext {
    * Must survive across callback invocations, because libcurl hands over arbitrary chunk sizes. One
    * chunk can cross several segments and one segment can take many chunks.
    */
-  std::size_t seg_idx{0};
+  std::size_t segment_index{0};
 
   // Default-constructible so the multi-handle backend can build a `RemoteMultiTransfer`
   // and fill `buf`/`size` once the surrounding sub-range has been computed.

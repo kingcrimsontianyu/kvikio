@@ -18,11 +18,11 @@ using kvikio::detail::TransferSegment;
 namespace {
 
 // The span of the running example in transfer_plan.hpp: three wanted pieces separated by two
-// holes.
+// gaps.
 //
 //   span      0        60      110     140     190     240
 //             |########|~~~~~~~~|######|~~~~~~~|######|
-//                 S0      hole     S1    hole    S2
+//                 S0      gap      S1    gap     S2
 constexpr std::size_t span_size = 240;
 
 class RemoteCallbackTest : public ::testing::Test {
@@ -96,16 +96,16 @@ TEST_F(RemoteCallbackTest, cursor_survives_many_small_chunks)
   EXPECT_EQ(_dst2, expected(190, 50));
 }
 
-TEST_F(RemoteCallbackTest, chunk_straddles_a_hole)
+TEST_F(RemoteCallbackTest, chunk_straddles_a_gap)
 {
-  // Ends mid-segment, then crosses the rest of S0, the whole first hole and into S1.
+  // Ends mid-segment, then crosses the rest of S0, the whole first gap and into S1.
   feed(50);
   feed(80);
 
   EXPECT_EQ(_dst0, expected(0, 60));
   EXPECT_THAT(std::vector<std::byte>(_dst1.begin(), _dst1.begin() + 20),
               testing::ElementsAreArray(expected(110, 20)));
-  EXPECT_EQ(_ctx.seg_idx, 1UL) << "still filling S1";
+  EXPECT_EQ(_ctx.segment_index, 1UL) << "still filling S1";
 }
 
 TEST_F(RemoteCallbackTest, gap_bytes_are_never_copied)
@@ -114,7 +114,7 @@ TEST_F(RemoteCallbackTest, gap_bytes_are_never_copied)
 
   // Nothing may be written past a segment's own length.
   EXPECT_EQ(_dst0.size(), 60UL);
-  EXPECT_NE(_dst0.back(), _source[60]) << "a hole byte leaked into S0";
+  EXPECT_NE(_dst0.back(), _source[60]) << "a gap byte leaked into S0";
   EXPECT_EQ(_dst1.front(), _source[110]);
   EXPECT_EQ(_dst2.front(), _source[190]);
 }
@@ -130,11 +130,11 @@ TEST_F(RemoteCallbackTest, overflow_is_reported)
 TEST_F(RemoteCallbackTest, retry_rewinds_the_cursor)
 {
   feed(200);
-  ASSERT_GT(_ctx.seg_idx, 0UL);
+  ASSERT_GT(_ctx.segment_index, 0UL);
 
   _ctx.reset_for_retry();
   EXPECT_EQ(_ctx.offset, 0);
-  EXPECT_EQ(_ctx.seg_idx, 0UL);
+  EXPECT_EQ(_ctx.segment_index, 0UL);
   EXPECT_FALSE(_ctx.overflow_error);
 
   // A retry re-sends the whole span, which must land exactly as it would have the first time.

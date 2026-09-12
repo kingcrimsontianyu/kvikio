@@ -175,7 +175,7 @@ struct RemoteMultiTransfer {
   CallbackContext ctx;
 
   // One entry per request this transfer serves. `pread()` always has exactly one.
-  std::vector<AggregateContribution> aggregates;
+  std::vector<AggregateContribution> contributions;
 
   // Concurrency slot held from stage (1) admission until this transfer is destroyed after
   // completion or failure. Empty while the transfer waits in the inbox. Destroying the transfer
