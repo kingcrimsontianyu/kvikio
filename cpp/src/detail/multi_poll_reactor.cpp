@@ -28,6 +28,7 @@
 #include <kvikio/remote_handle.hpp>
 #include <kvikio/shim/cuda.hpp>
 #include <kvikio/shim/libcurl.hpp>
+#include <kvikio/statistics/counters.hpp>
 #include <kvikio/utils.hpp>
 
 namespace kvikio::detail {
@@ -72,9 +73,11 @@ CurlMultiAttachment& CurlMultiAttachment::operator=(CurlMultiAttachment&& other)
 }
 
 namespace {
-// Fail every request this transfer serves with the same exception.
+// Fail every request this transfer serves with the same exception. Ends the attempt on the wire
+// first, if there is one, so its failure is recorded before any caller's future becomes ready.
 void fail_transfer(RemoteMultiTransfer& transfer, std::exception_ptr const& eptr) noexcept
 {
+  transfer.physical_recorder.reset();
   for (auto const& contribution : transfer.aggregates) {
     contribution.aggregate->on_subrange_failed(eptr);
   }
@@ -325,6 +328,10 @@ void MultiPollReactor::io_thread_main()
           }
           transfer->attachment = CurlMultiAttachment{_curl_multi, easy};
           transfer->slot       = std::move(slot);
+          // The request is on the wire from here, so this is where the transfer's own span starts.
+          // Everything before it was queueing, in the inbox or behind the limiter.
+          transfer->physical_recorder.emplace(
+            transfer->physical, transfer->file_offset, transfer->ctx.size);
           _in_flight.emplace(easy, std::move(transfer));
         } catch (...) {
           // Requeue the in-hand transfer (unless already failed above) and the already-deferred
@@ -364,6 +371,7 @@ void MultiPollReactor::io_thread_main()
                       std::runtime_error);
         auto transfer = std::move(it->second);
         _in_flight.erase(it);
+        count_http_connection_of(easy);
 
         std::exception_ptr transfer_err;
         try {
@@ -379,7 +387,7 @@ void MultiPollReactor::io_thread_main()
               if (segments.size() == 1) {
                 // What every `pread()` sub-range looks like. One copy, as before.
                 KVIKIO_CUDA_DRIVER_TRY(
-                  cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(segments[0].dst),
+                  cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(segments[0].buf),
                                                       pinned + segments[0].span_offset,
                                                       segments[0].length,
                                                       stream));
@@ -392,7 +400,7 @@ void MultiPollReactor::io_thread_main()
                 srcs.reserve(segments.size());
                 sizes.reserve(segments.size());
                 for (auto const& segment : segments) {
-                  dsts.push_back(convert_void2deviceptr(segment.dst));
+                  dsts.push_back(convert_void2deviceptr(segment.buf));
                   srcs.push_back(convert_void2deviceptr(pinned + segment.span_offset));
                   sizes.push_back(segment.length);
                 }
@@ -409,6 +417,8 @@ void MultiPollReactor::io_thread_main()
                                                               curl_multi_wakeup(curl_multi);
                                                           });
             }
+            // Before the aggregates, which may make the callers' futures ready.
+            transfer->physical_recorder->finish(transfer->ctx.size);
             for (auto const& contribution : transfer->aggregates) {
               contribution.aggregate->on_subrange_complete(contribution.bytes);
             }
@@ -431,6 +441,7 @@ void MultiPollReactor::io_thread_main()
 
             if (outcome.decision == RetryDecision::RETRY) {
               KVIKIO_LOG_WARN(outcome.message);
+              count_http_retry(outcome.delay_ms);
               auto const ready_at = std::chrono::steady_clock::now() + outcome.delay_ms;
               // If a shorter backoff appears
               if (earliest_ready_at.has_value()) {
@@ -438,6 +449,9 @@ void MultiPollReactor::io_thread_main()
               } else {
                 earliest_ready_at = ready_at;
               }
+              // Ends the failed attempt. The next admission starts a new observation, so the
+              // backoff shows as a gap rather than as one long transfer.
+              transfer->physical_recorder.reset();
               requeue_for_retry(std::move(transfer), ready_at);
               continue;
             }
@@ -552,6 +566,15 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
   _in_flight.clear();
 }
 
+namespace {
+std::atomic<bool> _pool_instantiated{false};
+}  // namespace
+
+bool MultiReactorPool::is_instantiated() noexcept
+{
+  return _pool_instantiated.load(std::memory_order_acquire);
+}
+
 MultiReactorPool::MultiReactorPool() : _dispatch{defaults::remote_io_reactor_dispatch()}
 {
   // Force LibCurl global init before any reactor opens a multi handle.
@@ -568,6 +591,8 @@ MultiReactorPool::MultiReactorPool() : _dispatch{defaults::remote_io_reactor_dis
   for (unsigned int i = 0; i < n; ++i) {
     _reactors.emplace_back(std::make_unique<MultiPollReactor>(this, per_reactor_max));
   }
+
+  _pool_instantiated.store(true, std::memory_order_release);
 }
 
 MultiReactorPool::~MultiReactorPool() noexcept

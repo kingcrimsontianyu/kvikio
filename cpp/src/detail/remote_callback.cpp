@@ -57,7 +57,7 @@ std::size_t callback_host_memory(char* data, std::size_t size, std::size_t nmemb
 
     auto const filled = position - segment.span_offset;
     auto const n      = std::min(remaining, segment.length - filled);
-    std::memcpy(static_cast<std::byte*>(segment.dst) + filled, src, n);
+    std::memcpy(static_cast<std::byte*>(segment.buf) + filled, src, n);
     src += n;
     ctx->offset += static_cast<std::ptrdiff_t>(n);
     remaining -= n;

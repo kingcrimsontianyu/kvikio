@@ -33,9 +33,9 @@ class RemoteCallbackTest : public ::testing::Test {
       _source[i] = static_cast<std::byte>(i % 251);
     }
     _ctx.size = span_size;
-    _ctx.segments.push_back({.span_offset = 0, .length = 60, .dst = _dst0.data()});
-    _ctx.segments.push_back({.span_offset = 110, .length = 30, .dst = _dst1.data()});
-    _ctx.segments.push_back({.span_offset = 190, .length = 50, .dst = _dst2.data()});
+    _ctx.segments.push_back({.span_offset = 0, .length = 60, .buf = _dst0.data()});
+    _ctx.segments.push_back({.span_offset = 110, .length = 30, .buf = _dst1.data()});
+    _ctx.segments.push_back({.span_offset = 190, .length = 50, .buf = _dst2.data()});
   }
 
   // Hands `nbytes` of the span to the callback, starting where the last call stopped.
