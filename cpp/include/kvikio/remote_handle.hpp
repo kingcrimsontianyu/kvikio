@@ -636,8 +636,9 @@ class RemoteHandle {
   /**
    * @brief Build one transfer for a byte range of this file, with its callback wired up.
    *
-   * The caller fills in the destinations, the aggregates and the retry policy. Shared by `pread()`
-   * and `remote_batch_read()` so there is one place that talks to the endpoint.
+   * The caller fills in the destinations, the aggregates, the retry policy, the physical
+   * observation context and, for device memory, the CUDA context. Shared by `pread()` and
+   * `remote_batch_read()` so there is one place that talks to the endpoint.
    *
    * @param file_offset Offset of the range in the remote file.
    * @param size Length of the range.

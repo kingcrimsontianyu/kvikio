@@ -28,6 +28,7 @@
 #include <kvikio/remote_handle.hpp>
 #include <kvikio/shim/cuda.hpp>
 #include <kvikio/shim/libcurl.hpp>
+#include <kvikio/statistics/counters.hpp>
 #include <kvikio/utils.hpp>
 
 namespace kvikio::detail {
@@ -75,8 +76,9 @@ namespace {
 // Fail every request this transfer serves with the same exception.
 void fail_transfer(RemoteMultiTransfer& transfer, std::exception_ptr const& eptr) noexcept
 {
-  for (auto const& contribution : transfer.aggregates) {
-    contribution.aggregate->on_subrange_failed(eptr);
+  transfer.physical_recorder.reset();
+  for (auto const& aggregate : transfer.aggregates) {
+    aggregate->on_subrange_failed(eptr);
   }
 }
 }  // namespace
@@ -97,21 +99,21 @@ RemoteMultiTransfer::~RemoteMultiTransfer()
   }
 }
 
-RemoteMultiAggregateContext::RemoteMultiAggregateContext(std::size_t num_subranges)
-  : _subranges_left{num_subranges}
+RemoteMultiAggregateContext::RemoteMultiAggregateContext(std::size_t num_subranges,
+                                                         std::size_t total_bytes)
+  : _subranges_left{num_subranges}, _total_bytes{total_bytes}
 {
   KVIKIO_EXPECT(num_subranges > 0,
                 "RemoteMultiAggregateContext requires at least one sub-range",
                 std::invalid_argument);
 }
 
-void RemoteMultiAggregateContext::on_subrange_complete(std::size_t bytes)
+void RemoteMultiAggregateContext::on_subrange_complete()
 {
-  _total_bytes.fetch_add(bytes, std::memory_order_relaxed);
-  // The last thread to decrement _subranges_left to zero fulfills the promise. Its acq_rel
-  // decrement acquires every other thread's relaxed _total_bytes writes (each released by that
-  // thread's own decrement), so the sum is complete. _first_exception needs no ordering here, since
-  // it is written and read under _exception_mutex.
+  // The last thread to decrement _subranges_left to zero fulfills the promise. The acq_rel
+  // decrement makes the other threads' writes into the caller's buffer visible to this thread
+  // before the promise is fulfilled, so the buffer is complete once `future.get()` returns.
+  // _first_exception needs no ordering here, since it is written and read under _exception_mutex.
   if (_subranges_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
     std::lock_guard<std::mutex> const lock(_exception_mutex);
     // Finish the observation before fulfilling the promise below. The other order would let the
@@ -120,13 +122,13 @@ void RemoteMultiAggregateContext::on_subrange_complete(std::size_t bytes)
       if (_first_exception) {
         recorder->finish_with_failure();
       } else {
-        recorder->finish(_total_bytes.load(std::memory_order_relaxed));
+        recorder->finish(_total_bytes);
       }
     }
     if (_first_exception) {
       _promise.set_exception(_first_exception);
     } else {
-      _promise.set_value(_total_bytes.load(std::memory_order_relaxed));
+      _promise.set_value(_total_bytes);
     }
   }
 }
@@ -325,6 +327,10 @@ void MultiPollReactor::io_thread_main()
           }
           transfer->attachment = CurlMultiAttachment{_curl_multi, easy};
           transfer->slot       = std::move(slot);
+          // The request is on the wire from here, so this is where the transfer's own span starts.
+          // Everything before it was queueing, in the inbox or behind the limiter.
+          transfer->physical_recorder.emplace(
+            transfer->physical, transfer->file_offset, transfer->ctx.size);
           _in_flight.emplace(easy, std::move(transfer));
         } catch (...) {
           // Requeue the in-hand transfer (unless already failed above) and the already-deferred
@@ -364,6 +370,7 @@ void MultiPollReactor::io_thread_main()
                       std::runtime_error);
         auto transfer = std::move(it->second);
         _in_flight.erase(it);
+        count_http_connection_of(easy);
 
         std::exception_ptr transfer_err;
         try {
@@ -377,14 +384,14 @@ void MultiPollReactor::io_thread_main()
               auto const& segments = transfer->ctx.segments;
               auto* pinned         = static_cast<std::byte*>(transfer->buffer.get());
               if (segments.size() == 1) {
-                // What every `pread()` sub-range looks like. One copy, as before.
+                auto const& segment = segments.front();
                 KVIKIO_CUDA_DRIVER_TRY(
-                  cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(segments[0].dst),
-                                                      pinned + segments[0].span_offset,
-                                                      segments[0].length,
+                  cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(segment.buf),
+                                                      pinned + segment.span_offset,
+                                                      segment.length,
                                                       stream));
               } else {
-                // A coalesced span. Copy the wanted pieces and leave the holes behind.
+                // Used for a coalesced transfer. Copy the wanted bytes and drop the gap bytes.
                 std::vector<CUdeviceptr> dsts;
                 std::vector<CUdeviceptr> srcs;
                 std::vector<std::size_t> sizes;
@@ -392,14 +399,14 @@ void MultiPollReactor::io_thread_main()
                 srcs.reserve(segments.size());
                 sizes.reserve(segments.size());
                 for (auto const& segment : segments) {
-                  dsts.push_back(convert_void2deviceptr(segment.dst));
+                  dsts.push_back(convert_void2deviceptr(segment.buf));
                   srcs.push_back(convert_void2deviceptr(pinned + segment.span_offset));
                   sizes.push_back(segment.length);
                 }
                 KVIKIO_CUDA_DRIVER_TRY(cudaAPI::cuda_memcpy_batch_async(dsts, srcs, sizes, stream));
               }
-              for (auto const& contribution : transfer->aggregates) {
-                contribution.aggregate->io_event_barrier->record_event(stream);
+              for (auto const& aggregate : transfer->aggregates) {
+                aggregate->io_event_barrier->record_event(stream);
               }
               BounceBufferCache::instance().recycle_after(transfer->device_ctx,
                                                           std::move(transfer->buffer),
@@ -409,8 +416,10 @@ void MultiPollReactor::io_thread_main()
                                                               curl_multi_wakeup(curl_multi);
                                                           });
             }
-            for (auto const& contribution : transfer->aggregates) {
-              contribution.aggregate->on_subrange_complete(contribution.bytes);
+            // Before the aggregates, which may make the callers' futures ready.
+            transfer->physical_recorder->finish(transfer->ctx.size);
+            for (auto const& aggregate : transfer->aggregates) {
+              aggregate->on_subrange_complete();
             }
           } else if (transfer->ctx.overflow_error) {
             // Prefer the handle's recorded error buffer. Fall back to the generic strerror text
@@ -431,6 +440,7 @@ void MultiPollReactor::io_thread_main()
 
             if (outcome.decision == RetryDecision::RETRY) {
               KVIKIO_LOG_WARN(outcome.message);
+              count_http_retry(outcome.delay_ms);
               auto const ready_at = std::chrono::steady_clock::now() + outcome.delay_ms;
               // If a shorter backoff appears
               if (earliest_ready_at.has_value()) {
@@ -438,6 +448,9 @@ void MultiPollReactor::io_thread_main()
               } else {
                 earliest_ready_at = ready_at;
               }
+              // Ends the failed attempt. The next admission starts a new observation, so the
+              // backoff shows as a gap rather than as one long transfer.
+              transfer->physical_recorder.reset();
               requeue_for_retry(std::move(transfer), ready_at);
               continue;
             }
@@ -501,7 +514,7 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
 {
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
 
-  // Extend the lifetime of the aggregates (shared pointers).
+  // Copy the aggregates (shared pointers) to keep them alive after the move below.
   auto aggregates = transfer->aggregates;
 
   try {
@@ -520,8 +533,8 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
     _pending.push_back(std::move(transfer));
   } catch (...) {
     auto const eptr = std::current_exception();
-    for (auto const& contribution : aggregates) {
-      contribution.aggregate->on_subrange_failed(eptr);
+    for (auto const& aggregate : aggregates) {
+      aggregate->on_subrange_failed(eptr);
     }
   }
 }
@@ -552,6 +565,15 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
   _in_flight.clear();
 }
 
+namespace {
+std::atomic<bool> _pool_instantiated{false};
+}  // namespace
+
+bool MultiReactorPool::is_instantiated() noexcept
+{
+  return _pool_instantiated.load(std::memory_order_acquire);
+}
+
 MultiReactorPool::MultiReactorPool() : _dispatch{defaults::remote_io_reactor_dispatch()}
 {
   // Force LibCurl global init before any reactor opens a multi handle.
@@ -568,6 +590,8 @@ MultiReactorPool::MultiReactorPool() : _dispatch{defaults::remote_io_reactor_dis
   for (unsigned int i = 0; i < n; ++i) {
     _reactors.emplace_back(std::make_unique<MultiPollReactor>(this, per_reactor_max));
   }
+
+  _pool_instantiated.store(true, std::memory_order_release);
 }
 
 MultiReactorPool::~MultiReactorPool() noexcept

@@ -35,6 +35,7 @@
 #include <kvikio/hdfs.hpp>
 #include <kvikio/remote_handle.hpp>
 #include <kvikio/shim/libcurl.hpp>
+#include <kvikio/statistics/counters.hpp>
 #include <kvikio/utils.hpp>
 
 namespace kvikio {
@@ -172,7 +173,10 @@ std::size_t get_file_size_using_head_impl(RemoteEndpoint& endpoint, std::string 
   endpoint.setopt(curl);
   curl.setopt(CURLOPT_NOBODY, 1L);
   curl.setopt(CURLOPT_FOLLOWLOCATION, 1L);
-  curl.perform();
+  {
+    detail::ScopedTimer const probe{detail::count_remote_size_probe};
+    curl.perform();
+  }
   curl_off_t cl;
   curl.getinfo(CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
   KVIKIO_EXPECT(
@@ -649,7 +653,10 @@ std::size_t S3EndpointWithPresignedUrl::get_file_size()
   curl.setopt(CURLOPT_HEADERDATA, static_cast<void*>(&file_size));
   curl.setopt(CURLOPT_HEADERFUNCTION, callback_header);
 
-  curl.perform();
+  {
+    detail::ScopedTimer const probe{detail::count_remote_size_probe};
+    curl.perform();
+  }
   return file_size;
 }
 
@@ -808,7 +815,19 @@ std::size_t RemoteHandle::read(void* buf, std::size_t size, std::size_t file_off
                                               size,
                                               _source,
                                               "GET"};
+  // One request for the whole range, with no chunking and no queue in front of it, so the physical
+  // record duplicates the logical one. Emitted anyway, so that a monitor watching only physical
+  // observations still sees every byte.
+  detail::PhysicalObservationContext const physical{
+    .backend     = remote_io_backend_of(*_endpoint),
+    .direction   = TransferDirection::READ,
+    .memory_kind = is_host_mem ? MemoryKind::HOST : MemoryKind::DEVICE,
+    .parent_id   = recorder.id(),
+    .source      = _source,
+    .http_method = "GET"};
+  detail::PhysicalObservationRecorder physical_recorder{physical, file_offset, size};
   auto const nbytes = read_impl(buf, size, file_offset, is_host_mem);
+  physical_recorder.finish(nbytes);
   recorder.finish(nbytes);
   return nbytes;
 }
@@ -871,14 +890,17 @@ std::unique_ptr<detail::RemoteMultiTransfer> RemoteHandle::make_transfer(std::si
                                                                          std::size_t size,
                                                                          bool is_device)
 {
-  auto transfer  = std::make_unique<detail::RemoteMultiTransfer>();
+  auto transfer = std::make_unique<detail::RemoteMultiTransfer>();
+  // MULTI_POLL uses multi handle's DNS cache sharing, and does not need the share handle.
   transfer->curl = std::make_unique<CurlHandle>(LibCurl::instance().get_handle(),
                                                 detail::fix_conda_file_path_hack(__FILE__),
-                                                KVIKIO_STRINGIFY(__LINE__));
+                                                KVIKIO_STRINGIFY(__LINE__),
+                                                /* use_shared_dns_cache = */ false);
   _endpoint->setopt(*transfer->curl);
   _endpoint->setup_range_request(*transfer->curl, file_offset, size);
-  transfer->ctx.size  = size;
-  transfer->is_device = is_device;
+  transfer->ctx.size    = size;
+  transfer->file_offset = file_offset;
+  transfer->is_device   = is_device;
   auto* const write_callback =
     is_device ? &detail::callback_pinned_buffer : &detail::callback_host_memory;
   transfer->curl->setopt(CURLOPT_WRITEFUNCTION, write_callback);
@@ -928,7 +950,7 @@ std::future<std::size_t> RemoteHandle::pread_impl(void* buf,
     }
   }
 
-  auto recorder = detail::monitoring_enabled()
+  auto recorder = detail::monitoring_enabled(ObservationKind::LOGICAL)
                     ? std::make_shared<detail::LogicalObservationRecorder>(
                         remote_io_backend_of(*_endpoint),
                         TransferDirection::READ,
@@ -939,15 +961,28 @@ std::future<std::size_t> RemoteHandle::pread_impl(void* buf,
                         "GET")
                     : nullptr;
 
+  // One observation per request, so the transfers are seen apart from the queueing in front of
+  // them.
+  detail::PhysicalObservationContext const physical{
+    .backend     = remote_io_backend_of(*_endpoint),
+    .direction   = TransferDirection::READ,
+    .memory_kind = is_host_mem ? MemoryKind::HOST : MemoryKind::DEVICE,
+    .parent_id   = recorder ? recorder->id() : std::nullopt,
+    .source      = _source,
+    .http_method = "GET"};
+
   if (io_backend == RemoteIOBackend::EASY_THREADPOOL) {
     auto& [nvtx_color, call_idx] = detail::get_next_color_and_call_idx();
 
-    auto task = [this, is_host_mem](void* devPtr_base,
-                                    std::size_t size,
-                                    std::size_t file_offset,
-                                    std::size_t devPtr_offset) -> std::size_t {
-      return read_impl(
-        static_cast<char*>(devPtr_base) + devPtr_offset, size, file_offset, is_host_mem);
+    auto task = [this, is_host_mem, physical](void* devPtr_base,
+                                              std::size_t size,
+                                              std::size_t file_offset,
+                                              std::size_t devPtr_offset) -> std::size_t {
+      detail::PhysicalObservationRecorder physical_recorder{physical, file_offset, size};
+      auto const bytes_read =
+        read_impl(static_cast<char*>(devPtr_base) + devPtr_offset, size, file_offset, is_host_mem);
+      physical_recorder.finish(bytes_read);
+      return bytes_read;
     };
     return detail::parallel_io(task,
                                buf,
@@ -976,7 +1011,7 @@ std::future<std::size_t> RemoteHandle::pread_impl(void* buf,
   //
   // Build all N transfers here, then hand them off in a single pool call.
   std::size_t const num_subranges = (task_size >= size) ? 1 : (size + task_size - 1) / task_size;
-  auto aggregate      = std::make_shared<detail::RemoteMultiAggregateContext>(num_subranges);
+  auto aggregate      = std::make_shared<detail::RemoteMultiAggregateContext>(num_subranges, size);
   aggregate->recorder = recorder;
   auto fut            = aggregate->get_future();
 
@@ -998,10 +1033,10 @@ std::future<std::size_t> RemoteHandle::pread_impl(void* buf,
     std::size_t const subrange_size = std::min(task_size, remaining);
     auto transfer                   = make_transfer(cur_off, subrange_size, !is_host_mem);
     transfer->retry_policy          = retry_policy;
-    // One request and one destination covering the whole span. Only the batch API produces several.
-    transfer->aggregates.push_back({.aggregate = aggregate, .bytes = subrange_size});
+    transfer->physical              = physical;
+    transfer->aggregates.push_back(aggregate);
     transfer->ctx.segments.push_back(
-      {.span_offset = 0, .length = subrange_size, .dst = cur_buf, .request_index = 0});
+      {.span_offset = 0, .length = subrange_size, .buf = cur_buf, .request_index = 0});
     if (!is_host_mem) { transfer->device_ctx = io_event_barrier->cuda_context(); }
     transfers.push_back(std::move(transfer));
     cur_buf += subrange_size;
@@ -1117,7 +1152,7 @@ std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequ
     }
     plan_requests.push_back({.handle       = request.handle,
                              .cuda_context = cuda_context,
-                             .dst          = request.buf,
+                             .buf          = request.buf,
                              .file_offset  = request.file_offset,
                              .size         = request.size});
   }
@@ -1137,9 +1172,9 @@ std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequ
     }
 
     auto const cuda_context = plan_requests[i].cuda_context;
-    aggregates[i] =
-      std::make_shared<detail::RemoteMultiAggregateContext>(plan.transfers_per_request[i]);
-    if (detail::monitoring_enabled()) {
+    aggregates[i]           = std::make_shared<detail::RemoteMultiAggregateContext>(
+      plan.transfers_per_request[i], request.size);
+    if (detail::monitoring_enabled(ObservationKind::LOGICAL)) {
       aggregates[i]->recorder = std::make_shared<detail::LogicalObservationRecorder>(
         remote_io_backend_of(*request.handle->_endpoint),
         TransferDirection::READ,
@@ -1176,9 +1211,19 @@ std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequ
     for (auto k = planned.segment_begin; k < planned.segment_end; ++k) {
       auto const& segment = plan.segments[k];
       transfer->ctx.segments.push_back(segment);
-      transfer->aggregates.push_back(
-        {.aggregate = aggregates[segment.request_index], .bytes = segment.length});
+      transfer->aggregates.push_back(aggregates[segment.request_index]);
     }
+
+    // One physical observation per transfer. A transfer that serves one request belongs to that
+    // request's logical observation. A merged transfer serves several, so it points at none.
+    bool const single_request = planned.segment_end - planned.segment_begin == 1;
+    auto const& parent = aggregates[plan.segments[planned.segment_begin].request_index]->recorder;
+    transfer->physical = {.backend     = remote_io_backend_of(*planned.handle->_endpoint),
+                          .direction   = TransferDirection::READ,
+                          .memory_kind = is_device ? MemoryKind::DEVICE : MemoryKind::HOST,
+                          .parent_id   = (single_request && parent) ? parent->id() : std::nullopt,
+                          .source      = planned.handle->_source,
+                          .http_method = "GET"};
     transfers.push_back(std::move(transfer));
   }
 

@@ -54,7 +54,7 @@ class MultiReactorPool;  // Forward declaration, because reactors needs to hold 
  * `std::shared_ptr<RemoteMultiAggregateContext>`. As completions arrive on the reactor threads
  * (potentially in parallel when `KVIKIO_REMOTE_IO_NUM_REACTORS > 1`), each one calls
  * `on_subrange_complete()` or `on_subrange_failed()`. The thread that decrements `_subranges_left`
- * to zero fulfills `_promise`, with the accumulated byte total on success, or with the first
+ * to zero fulfills `_promise`, with the request's byte count on success, or with the first
  * captured exception on failure.
  */
 class RemoteMultiAggregateContext {
@@ -63,8 +63,9 @@ class RemoteMultiAggregateContext {
    * @brief Construct an aggregate that expects exactly `num_subranges` completion events.
    *
    * @param num_subranges Number of sub-range transfers the caller has split the read into.
+   * @param total_bytes Number of bytes the read covers.
    */
-  explicit RemoteMultiAggregateContext(std::size_t num_subranges);
+  RemoteMultiAggregateContext(std::size_t num_subranges, std::size_t total_bytes);
 
   /**
    * @brief Per-pread event barrier for the device-buffer path.
@@ -78,10 +79,8 @@ class RemoteMultiAggregateContext {
 
   /**
    * @brief Report that one sub-range transfer succeeded.
-   *
-   * @param bytes Number of bytes the sub-range delivered.
    */
-  void on_subrange_complete(std::size_t bytes);
+  void on_subrange_complete();
 
   /**
    * @brief Report that one sub-range transfer failed. The first exception captured wins.
@@ -98,7 +97,7 @@ class RemoteMultiAggregateContext {
 
  private:
   std::atomic<std::size_t> _subranges_left;
-  std::atomic<std::size_t> _total_bytes{0};
+  std::size_t const _total_bytes;
   std::mutex _exception_mutex;
   std::exception_ptr _first_exception;
   std::promise<std::size_t> _promise;
@@ -149,17 +148,6 @@ class CurlMultiAttachment {
 };
 
 /**
- * @brief One request's share of a transfer, and how many of the span's bytes belong to it.
- *
- * A transfer that serves several merged requests holds one of these per request. On success each
- * aggregate is told its own byte count, and on failure all of them get the same exception.
- */
-struct AggregateContribution {
-  std::shared_ptr<RemoteMultiAggregateContext> aggregate;
-  std::size_t bytes;
-};
-
-/**
  * @brief Per-transfer state owned by a `MultiPollReactor` between submission and completion.
  *
  * One `RemoteMultiTransfer` corresponds to one libcurl easy handle, which corresponds to one HTTP
@@ -174,8 +162,10 @@ struct RemoteMultiTransfer {
 
   CallbackContext ctx;
 
-  // One entry per request this transfer serves. `pread()` always has exactly one.
-  std::vector<AggregateContribution> aggregates;
+  // One transfer may map to more than one requests due to coalesce. Each element maps to one
+  // request. `pread()` always has 1 element. On success each element has their sub-range marked
+  // completed. On failure all of them get the same exception.
+  std::vector<std::shared_ptr<RemoteMultiAggregateContext>> aggregates;
 
   // Concurrency slot held from stage (1) admission until this transfer is destroyed after
   // completion or failure. Empty while the transfer waits in the inbox. Destroying the transfer
@@ -189,6 +179,17 @@ struct RemoteMultiTransfer {
 
   // Retry bookkeeping. Number of attempts that have finished.
   std::size_t attempt{0};
+
+  // Byte offset of this sub-range in the remote object.
+  std::size_t file_offset{0};
+
+  // What every attempt of this sub-range shares.
+  PhysicalObservationContext physical{};
+
+  // The attempt currently on the wire. Started when the easy handle joins the multi handle,
+  // finished at completion, and destroyed on failure or before a retry, so one attempt is one
+  // observation and a backoff is a gap between two of them.
+  std::optional<PhysicalObservationRecorder> physical_recorder;
 
   // Earliest time this transfer may be admitted. Used to space out retries.
   // The default is the clock epoch, which is always in the past, so a freshly submitted transfer is
@@ -329,6 +330,15 @@ class MultiReactorPool {
    * pool, `LibCurl`, the reactor threads, and (future) CUDA teardown.
    */
   static MultiReactorPool& instance();
+
+  /**
+   * @brief Whether the pool singleton has already been constructed.
+   *
+   * `num_reactors`, the dispatch mode, and the concurrency cap are all captured once in the
+   * pool's constructor, so changing them after this returns `true` would silently have no effect.
+   * Used by `kvikio::defaults` to reject such changes with an exception instead.
+   */
+  [[nodiscard]] static bool is_instantiated() noexcept;
 
   MultiReactorPool(MultiReactorPool const&)            = delete;
   MultiReactorPool& operator=(MultiReactorPool const&) = delete;
