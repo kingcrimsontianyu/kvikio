@@ -23,13 +23,8 @@ struct curl_slist;
 
 namespace kvikio {
 
-class CurlHandle;    // Prototype
-class RemoteHandle;  // Prototype
-
-namespace detail {
-// Defined in detail/multi_poll_reactor.hpp, which includes this header.
-struct RemoteMultiTransfer;
-}  // namespace detail
+class CurlHandle;
+class RemoteHandle;
 
 /**
  * @brief Types of remote file endpoints supported by KvikIO.
@@ -354,9 +349,6 @@ class S3EndpointWithPresignedUrl : public RemoteEndpoint {
 RemoteEndpointType infer_remote_endpoint_type(std::string const& url);
 
 /**
- * @brief Handle of remote file.
- */
-/**
  * @brief One range of one remote file, and where its bytes should land.
  */
 struct RemoteReadRequest {
@@ -408,27 +400,8 @@ struct RemoteBatchReadOptions {
 };
 
 /**
- * @brief Read many ranges, possibly from several files, in one submission.
- *
- * Result `i` belongs to request `i` and carries that request's byte count, not the count of any
- * merged span it rode in on. The input is never reordered.
- *
- * Nothing is submitted unless the whole batch validates, so a throw leaves no work in flight and
- * no future for the caller to wait on.
- *
- * @param requests The ranges to read. A zero-size request yields a ready future holding 0.
- * @param opts How to carry the batch out.
- * @return One future per request, in the caller's order. Empty input yields an empty vector.
- * @exception std::invalid_argument if a request has a null handle or buffer, if it reads past the
- * end of its file, if the resolved `task_size` is zero or larger than the bounce buffer for a
- * device destination, or if `backend` is explicitly `EASY_THREADPOOL` alongside an explicit
- * `coalesce_max_gap` or `dispatch`.
- *
- * @note The returned futures must not outlive the handles the requests name.
+ * @brief Handle of remote file.
  */
-std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequest const> requests,
-                                                        RemoteBatchReadOptions const& opts = {});
-
 class RemoteHandle {
  private:
   std::unique_ptr<RemoteEndpoint> _endpoint;
@@ -611,6 +584,28 @@ class RemoteHandle {
                                  std::size_t task_size   = defaults::task_size(),
                                  ThreadPool* thread_pool = &defaults::thread_pool());
 
+  /**
+   * @brief Read many ranges, possibly from several files, in one submission.
+   *
+   * Result `i` belongs to request `i` and carries that request's byte count, not the count of any
+   * merged transfer it rode in on. The input is never reordered.
+   *
+   * Nothing is submitted unless the whole batch validates, so a throw leaves no work in flight
+   * and no future for the caller to wait on.
+   *
+   * @param requests The ranges to read. A zero-size request yields a ready future holding 0.
+   * @param opts How to carry the batch out.
+   * @return One future per request, in the caller's order. Empty input yields an empty vector.
+   * @exception std::invalid_argument if a request has a null handle or buffer, if it reads past
+   * the end of its file, if the resolved `task_size` is zero or larger than the bounce buffer for
+   * a device destination, or if `backend` is explicitly `EASY_THREADPOOL` alongside an explicit
+   * `coalesce_max_gap` or `dispatch`.
+   *
+   * @note The returned futures must not outlive the handles the requests name.
+   */
+  static std::vector<std::future<std::size_t>> batch_read(
+    std::span<RemoteReadRequest const> requests, RemoteBatchReadOptions const& opts = {});
+
  private:
   /**
    * @brief Throw if `[file_offset, file_offset + size)` reaches past the end of the remote object.
@@ -632,25 +627,6 @@ class RemoteHandle {
                                       std::size_t task_size,
                                       ThreadPool* thread_pool,
                                       RemoteIOBackend io_backend);
-
-  /**
-   * @brief Build one transfer for a byte range of this file, with its callback wired up.
-   *
-   * The caller fills in the destinations, the aggregates, the retry policy, the physical
-   * observation context and, for device memory, the CUDA context. Shared by `pread()` and
-   * `remote_batch_read()` so there is one place that talks to the endpoint.
-   *
-   * @param file_offset Offset of the range in the remote file.
-   * @param size Length of the range.
-   * @param is_device Whether the destination is device memory.
-   * @return The transfer, ready for its destinations to be attached.
-   */
-  [[nodiscard]] std::unique_ptr<detail::RemoteMultiTransfer> make_transfer(std::size_t file_offset,
-                                                                           std::size_t size,
-                                                                           bool is_device);
-
-  friend std::vector<std::future<std::size_t>> remote_batch_read(
-    std::span<RemoteReadRequest const> requests, RemoteBatchReadOptions const& opts);
 };
 
 }  // namespace kvikio

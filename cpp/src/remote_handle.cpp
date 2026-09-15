@@ -886,7 +886,17 @@ std::size_t RemoteHandle::read_impl(void* buf,
   return size;
 }
 
-std::unique_ptr<detail::RemoteMultiTransfer> RemoteHandle::make_transfer(std::size_t file_offset,
+namespace {
+
+/**
+ * @brief Build one transfer for a byte range of `endpoint`, with its callback wired up.
+ *
+ * The caller fills in the destinations, the aggregates, the retry policy, the physical observation
+ * context and, for device memory, the CUDA context. Shared by `pread()` and `batch_read()` so there
+ * is one place that talks to the endpoint.
+ */
+[[nodiscard]] std::unique_ptr<detail::RemoteMultiTransfer> make_transfer(RemoteEndpoint& endpoint,
+                                                                         std::size_t file_offset,
                                                                          std::size_t size,
                                                                          bool is_device)
 {
@@ -896,8 +906,8 @@ std::unique_ptr<detail::RemoteMultiTransfer> RemoteHandle::make_transfer(std::si
                                                 detail::fix_conda_file_path_hack(__FILE__),
                                                 KVIKIO_STRINGIFY(__LINE__),
                                                 /* use_shared_dns_cache = */ false);
-  _endpoint->setopt(*transfer->curl);
-  _endpoint->setup_range_request(*transfer->curl, file_offset, size);
+  endpoint.setopt(*transfer->curl);
+  endpoint.setup_range_request(*transfer->curl, file_offset, size);
   transfer->ctx.size    = size;
   transfer->file_offset = file_offset;
   transfer->is_device   = is_device;
@@ -907,6 +917,8 @@ std::unique_ptr<detail::RemoteMultiTransfer> RemoteHandle::make_transfer(std::si
   transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
   return transfer;
 }
+
+}  // namespace
 
 std::future<std::size_t> RemoteHandle::pread(void* buf,
                                              std::size_t size,
@@ -1031,9 +1043,9 @@ std::future<std::size_t> RemoteHandle::pread_impl(void* buf,
   auto cur_buf          = static_cast<char*>(buf);
   for (std::size_t i = 0; i < num_subranges; ++i) {
     std::size_t const subrange_size = std::min(task_size, remaining);
-    auto transfer                   = make_transfer(cur_off, subrange_size, !is_host_mem);
-    transfer->retry_policy          = retry_policy;
-    transfer->physical              = physical;
+    auto transfer          = make_transfer(*_endpoint, cur_off, subrange_size, !is_host_mem);
+    transfer->retry_policy = retry_policy;
+    transfer->physical     = physical;
     transfer->aggregates.push_back(aggregate);
     transfer->ctx.segments.push_back(
       {.span_offset = 0, .length = subrange_size, .buf = cur_buf, .request_index = 0});
@@ -1062,13 +1074,13 @@ namespace {
 // Names the offending request, so a rejected batch says which one was wrong.
 [[nodiscard]] std::string request_error(std::size_t index, std::string_view what)
 {
-  return "remote_batch_read: request " + std::to_string(index) + " " + std::string{what};
+  return "RemoteHandle::batch_read: request " + std::to_string(index) + " " + std::string{what};
 }
 
 }  // namespace
 
-std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequest const> requests,
-                                                        RemoteBatchReadOptions const& opts)
+std::vector<std::future<std::size_t>> RemoteHandle::batch_read(
+  std::span<RemoteReadRequest const> requests, RemoteBatchReadOptions const& opts)
 {
   std::size_t total_bytes = 0;
   for (auto const& request : requests) {
@@ -1084,22 +1096,21 @@ std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequ
   auto* const thread_pool =
     (opts.thread_pool != nullptr) ? opts.thread_pool : &defaults::thread_pool();
 
-  // Naming a backend that cannot honor the other options is a contract error. Inheriting that
-  // backend from the process default is not, since the caller did not ask for the combination.
   if (opts.backend == RemoteIOBackend::EASY_THREADPOOL) {
-    KVIKIO_EXPECT(!opts.coalesce_max_gap.has_value(),
-                  "remote_batch_read: EASY_THREADPOOL does not implement coalescing yet, so "
-                  "`backend` and `coalesce_max_gap` cannot both be honored",
-                  std::invalid_argument);
+    KVIKIO_EXPECT(
+      !opts.coalesce_max_gap.has_value(),
+      "RemoteHandle::batch_read: EASY_THREADPOOL does not implement coalescing. "
+      "`backend` (with EASY_THREADPOOL explicitly) and `coalesce_max_gap` cannot be used together",
+      std::invalid_argument);
     KVIKIO_EXPECT(!opts.dispatch.has_value(),
-                  "remote_batch_read: EASY_THREADPOOL has no reactors, so `dispatch` has no "
+                  "RemoteHandle::batch_read: EASY_THREADPOOL has no reactors, so `dispatch` has no "
                   "meaning there",
                   std::invalid_argument);
   } else if (io_backend == RemoteIOBackend::EASY_THREADPOOL &&
              (opts.coalesce_max_gap.has_value() || opts.dispatch.has_value())) {
-    KVIKIO_LOG_DEBUG(
-      "remote_batch_read(): ignoring `coalesce_max_gap` and `dispatch`, since the "
-      "process default selected the EASY_THREADPOOL backend");
+    KVIKIO_LOG_WARN(
+      "RemoteHandle::batch_read: ignoring `coalesce_max_gap` and `dispatch`, since the process "
+      "default selected the EASY_THREADPOOL backend");
   }
 
   KVIKIO_EXPECT(task_size > 0, "`task_size` must be positive", std::invalid_argument);
@@ -1205,7 +1216,8 @@ std::vector<std::future<std::size_t>> remote_batch_read(std::span<RemoteReadRequ
   transfers.reserve(plan.transfers.size());
   for (auto const& planned : plan.transfers) {
     bool const is_device = planned.cuda_context != nullptr;
-    auto transfer = planned.handle->make_transfer(planned.file_offset, planned.size, is_device);
+    auto transfer =
+      make_transfer(*planned.handle->_endpoint, planned.file_offset, planned.size, is_device);
     transfer->retry_policy = retry_policy;
     if (is_device) { transfer->device_ctx = planned.cuda_context; }
     for (auto k = planned.segment_begin; k < planned.segment_end; ++k) {

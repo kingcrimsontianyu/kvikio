@@ -207,7 +207,7 @@ class BatchReadTest : public testing::Test {
 
 TEST_F(BatchReadTest, empty_input_is_not_an_error)
 {
-  EXPECT_TRUE(kvikio::remote_batch_read({}).empty());
+  EXPECT_TRUE(kvikio::RemoteHandle::batch_read({}).empty());
 }
 
 TEST_F(BatchReadTest, zero_size_request_is_ready)
@@ -216,7 +216,7 @@ TEST_F(BatchReadTest, zero_size_request_is_ready)
   std::vector<kvikio::RemoteReadRequest> requests{
     {.handle = &handle, .buf = nullptr, .size = 0, .file_offset = 10}};
 
-  auto futures = kvikio::remote_batch_read(requests);
+  auto futures = kvikio::RemoteHandle::batch_read(requests);
   ASSERT_EQ(futures.size(), 1UL);
   EXPECT_EQ(futures[0].get(), 0UL);
   EXPECT_EQ(endpoints()[0]->range_request_calls, 0);
@@ -229,7 +229,7 @@ TEST_F(BatchReadTest, null_handle_names_its_index)
     {.handle = &handle, .buf = _buffer.data(), .size = 10},
     {.handle = nullptr, .buf = _buffer.data(), .size = 10}};
 
-  EXPECT_THAT([&] { kvikio::remote_batch_read(requests); },
+  EXPECT_THAT([&] { kvikio::RemoteHandle::batch_read(requests); },
               ThrowsMessage<std::invalid_argument>(HasSubstr("request 1 has a null handle")));
   EXPECT_EQ(endpoints()[0]->range_request_calls, 0) << "nothing may be issued before validating";
 }
@@ -239,7 +239,7 @@ TEST_F(BatchReadTest, null_buffer_names_its_index)
   auto handle = make_handle();
   std::vector<kvikio::RemoteReadRequest> requests{{.handle = &handle, .buf = nullptr, .size = 10}};
 
-  EXPECT_THAT([&] { kvikio::remote_batch_read(requests); },
+  EXPECT_THAT([&] { kvikio::RemoteHandle::batch_read(requests); },
               ThrowsMessage<std::invalid_argument>(HasSubstr("request 0 has a null buffer")));
   EXPECT_EQ(endpoints()[0]->range_request_calls, 0);
 }
@@ -252,7 +252,7 @@ TEST_F(BatchReadTest, out_of_bounds_request_names_its_index)
     {.handle = &handle, .buf = _buffer.data(), .size = 10, .file_offset = 95}};
 
   EXPECT_THAT(
-    [&] { kvikio::remote_batch_read(requests); },
+    [&] { kvikio::RemoteHandle::batch_read(requests); },
     ThrowsMessage<std::invalid_argument>(HasSubstr("request 1 reads past the end of its file")));
   EXPECT_EQ(endpoints()[0]->range_request_calls, 0);
 }
@@ -265,7 +265,7 @@ TEST_F(BatchReadTest, naming_easy_backend_and_coalescing_together_throws)
 
   EXPECT_THAT(
     [&] {
-      kvikio::remote_batch_read(
+      kvikio::RemoteHandle::batch_read(
         requests, {.backend = kvikio::RemoteIOBackend::EASY_THREADPOOL, .coalesce_max_gap = 64});
     },
     ThrowsMessage<std::invalid_argument>(HasSubstr("does not implement coalescing")));
@@ -279,9 +279,9 @@ TEST_F(BatchReadTest, naming_easy_backend_and_dispatch_together_throws)
 
   EXPECT_THAT(
     [&] {
-      kvikio::remote_batch_read(requests,
-                                {.backend  = kvikio::RemoteIOBackend::EASY_THREADPOOL,
-                                 .dispatch = kvikio::RemoteReactorDispatch::PER_CHUNK});
+      kvikio::RemoteHandle::batch_read(requests,
+                                       {.backend  = kvikio::RemoteIOBackend::EASY_THREADPOOL,
+                                        .dispatch = kvikio::RemoteReactorDispatch::PER_CHUNK});
     },
     ThrowsMessage<std::invalid_argument>(HasSubstr("has no reactors")));
 }
@@ -292,7 +292,7 @@ TEST_F(BatchReadTest, zero_task_size_throws)
   std::vector<kvikio::RemoteReadRequest> requests{
     {.handle = &handle, .buf = _buffer.data(), .size = 10}};
 
-  EXPECT_THAT([&] { kvikio::remote_batch_read(requests, {.task_size = 0}); },
+  EXPECT_THAT([&] { kvikio::RemoteHandle::batch_read(requests, {.task_size = 0}); },
               ThrowsMessage<std::invalid_argument>(HasSubstr("`task_size` must be positive")));
 }
 
