@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -48,21 +49,18 @@ class RemoteHandleTest : public testing::Test {
   {
     _sample_urls = {
       // Endpoint type: S3
-      {"s3://bucket-name/object-key-name", kvikio::RemoteEndpointType::S3_PUBLIC},
-      {"s3://bucket-name/object-key-name-dir/object-key-name-file",
-       kvikio::RemoteEndpointType::S3_PUBLIC},
+      {"s3://bucket-name/object-key-name", kvikio::RemoteEndpointType::S3},
+      {"s3://bucket-name/object-key-name-dir/object-key-name-file", kvikio::RemoteEndpointType::S3},
       {"https://bucket-name.s3.region-code.amazonaws.com/object-key-name",
-       kvikio::RemoteEndpointType::S3_PUBLIC},
+       kvikio::RemoteEndpointType::S3},
       {"https://s3.region-code.amazonaws.com/bucket-name/object-key-name",
-       kvikio::RemoteEndpointType::S3_PUBLIC},
-      {"https://bucket-name.s3.amazonaws.com/object-key-name",
-       kvikio::RemoteEndpointType::S3_PUBLIC},
-      {"https://s3.amazonaws.com/bucket-name/object-key-name",
-       kvikio::RemoteEndpointType::S3_PUBLIC},
+       kvikio::RemoteEndpointType::S3},
+      {"https://bucket-name.s3.amazonaws.com/object-key-name", kvikio::RemoteEndpointType::S3},
+      {"https://s3.amazonaws.com/bucket-name/object-key-name", kvikio::RemoteEndpointType::S3},
       {"https://bucket-name.s3-region-code.amazonaws.com/object-key-name",
-       kvikio::RemoteEndpointType::S3_PUBLIC},
+       kvikio::RemoteEndpointType::S3},
       {"https://s3-region-code.amazonaws.com/bucket-name/object-key-name",
-       kvikio::RemoteEndpointType::S3_PUBLIC},
+       kvikio::RemoteEndpointType::S3},
 
       // Endpoint type: S3 presigned URL
       {"https://bucket-name.s3.region-code.amazonaws.com/"
@@ -89,13 +87,10 @@ class RemoteHandleTest : public testing::Test {
 
         // Test unified interface
         {
-          // Here we pass the 1-byte argument to RemoteHandle::open. For all endpoints except
-          // kvikio::RemoteEndpointType::S3 in AUTO mode, this prevents querying the file size and
-          // sending requests to the server, thus allowing us to use dummy URLs for testing.
-          // For kvikio::RemoteEndpointType::S3 with AUTO, RemoteHandle::open sends a HEAD request
-          // as a connectivity check (and reuses that size when nbytes is not provided). It will
-          // fail on the syntactically valid dummy URL, and kvikio::RemoteEndpointType::S3_PUBLIC
-          // will then be used as the endpoint.
+          // Here we pass the 1-byte argument to RemoteHandle::open. This prevents querying the
+          // file size and, for kvikio::RemoteEndpointType::S3 in AUTO mode, the HEAD request used
+          // as a connectivity check. No request is sent to the server, thus allowing us to use
+          // dummy URLs for testing.
           auto remote_handle =
             kvikio::RemoteHandle::open(url, kvikio::RemoteEndpointType::AUTO, std::nullopt, 1);
           EXPECT_EQ(remote_handle.remote_endpoint_type(), expected_endpoint_type);
@@ -196,7 +191,7 @@ TEST_F(RemoteHandleTest, test_s3_url)
                                           {"AWS_SECRET_ACCESS_KEY", "my_aws_secrete_access_key"}};
 
   {
-    test_helper(kvikio::RemoteEndpointType::S3_PUBLIC, kvikio::S3Endpoint::is_url_valid);
+    test_helper(kvikio::RemoteEndpointType::S3, kvikio::S3Endpoint::is_url_valid);
   }
 
   // Invalid URLs
@@ -215,16 +210,15 @@ TEST_F(RemoteHandleTest, test_s3_url)
     }
   }
 
-  // S3_PUBLIC is not in the allowlist. So when the connectivity check fails on the dummy URL,
-  // KvikIO cannot fall back to S3_PUBLIC.
+  // Without nbytes, AUTO mode sends the connectivity check, which fails on the dummy URL. S3_PUBLIC
+  // is not in the allowlist, so KvikIO cannot fall back to it.
   {
     EXPECT_ANY_THROW({
       kvikio::RemoteHandle::open(
         "s3://bucket-name/object-key-name",
         kvikio::RemoteEndpointType::AUTO,
         std::vector<kvikio::RemoteEndpointType>{kvikio::RemoteEndpointType::S3,
-                                                kvikio::RemoteEndpointType::HTTP},
-        1);
+                                                kvikio::RemoteEndpointType::HTTP});
     });
   }
 }
@@ -351,4 +345,31 @@ TEST_F(RemoteHandleTest, test_infer_remote_endpoint_type)
               ThrowsMessage<std::runtime_error>(HasSubstr("Unsupported endpoint URL")));
   EXPECT_THAT([&] { kvikio::infer_remote_endpoint_type("example.com/path"); },
               ThrowsMessage<std::runtime_error>(HasSubstr("Bad scheme")));
+}
+
+TEST_F(RemoteHandleTest, s3_multipart_part_size)
+{
+  constexpr std::size_t MiB = std::size_t{1} << 20;
+  // Below the S3 minimum, the part size is raised to 5 MiB.
+  EXPECT_EQ(kvikio::detail::s3_multipart_part_size(100 * MiB, 4 * MiB), 5 * MiB);
+  EXPECT_EQ(kvikio::detail::s3_multipart_part_size(100, 1), 5 * MiB);
+  // At or above the minimum, the requested size is kept.
+  EXPECT_EQ(kvikio::detail::s3_multipart_part_size(100 * MiB, 8 * MiB), 8 * MiB);
+  // Objects that would need more than 10,000 parts get larger parts.
+  constexpr std::size_t big = 10000 * 8 * MiB + 1;
+  EXPECT_EQ(kvikio::detail::s3_multipart_part_size(big, 8 * MiB), 8 * MiB + 1);
+  EXPECT_THAT([] { std::ignore = kvikio::detail::s3_multipart_part_size(100, 0); },
+              ThrowsMessage<std::invalid_argument>(HasSubstr("must be positive")));
+}
+
+TEST_F(RemoteHandleTest, write_to_read_only_endpoint_throws)
+{
+  // The size is given, so no request is sent at construction, and the write is rejected before
+  // any request is sent.
+  kvikio::RemoteHandle handle(std::make_unique<kvikio::HttpEndpoint>("http://127.0.0.1:1/file"), 0);
+  std::vector<char> const buf(16);
+  EXPECT_THAT([&] { handle.write(buf.data(), buf.size()); },
+              ThrowsMessage<std::runtime_error>(HasSubstr("does not support writes")));
+  EXPECT_THAT([&] { handle.pwrite(buf.data(), buf.size()).get(); },
+              ThrowsMessage<std::runtime_error>(HasSubstr("does not support writes")));
 }

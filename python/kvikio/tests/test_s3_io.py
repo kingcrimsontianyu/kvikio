@@ -230,3 +230,87 @@ def test_open_invalid(s3_base):
             kvikio.RemoteFile.open(url)
         with pytest.raises(RuntimeError, match="Invalid URL"):
             kvikio.RemoteFile.open(url, kvikio.RemoteEndpointType.S3)
+
+
+@pytest.mark.parametrize("nthreads", [1, 3])
+def test_write(s3_base, xp, nthreads):
+    bucket_name = "test_write"
+    object_name = "written"
+    a = xp.arange(1000, dtype=xp.int64)
+    with s3_context(s3_base=s3_base, bucket=bucket_name) as server_address:
+        with kvikio.defaults.set({"num_threads": nthreads}):
+            # The object does not exist yet, so the size is given to skip the probe.
+            with kvikio.RemoteFile.open_s3(bucket_name, object_name, nbytes=0) as f:
+                assert f.write(a) == a.nbytes
+                assert f.nbytes() == a.nbytes
+
+        client = boto3.client("s3", endpoint_url=server_address)
+        got = client.get_object(Bucket=bucket_name, Key=object_name)["Body"].read()
+        xp.testing.assert_array_equal(a, xp.frombuffer(got, dtype=a.dtype))
+
+        # Read back through KvikIO as well.
+        with kvikio.RemoteFile.open_s3(bucket_name, object_name) as f:
+            b = xp.empty_like(a)
+            assert f.read(b) == a.nbytes
+            xp.testing.assert_array_equal(a, b)
+
+
+@pytest.mark.parametrize("nthreads", [1, 4])
+@pytest.mark.parametrize("task_size", [1024, 5 * 2**20, 6 * 2**20])
+@pytest.mark.parametrize("bounce_buffer_size", [4 * 2**20, 1000])
+def test_pwrite_multipart(s3_base, xp, nthreads, task_size, bounce_buffer_size):
+    """Write an object of 11 MiB, which S3 splits into 5 MiB parts at the least."""
+    bucket_name = "test_pwrite_multipart"
+    object_name = "multipart"
+    a = xp.arange(11 * 2**20 // 8, dtype=xp.int64)
+    with s3_context(s3_base=s3_base, bucket=bucket_name) as server_address:
+        with kvikio.defaults.set(
+            {"num_threads": nthreads, "bounce_buffer_size": bounce_buffer_size}
+        ):
+            url = f"{server_address}/{bucket_name}/{object_name}"
+            with kvikio.RemoteFile.open_s3_url(url, nbytes=0) as f:
+                fut = f.pwrite(a, task_size=task_size)
+                assert fut.get() == a.nbytes
+                assert f.nbytes() == a.nbytes
+
+        client = boto3.client("s3", endpoint_url=server_address)
+        got = client.get_object(Bucket=bucket_name, Key=object_name)["Body"].read()
+        xp.testing.assert_array_equal(a, xp.frombuffer(got, dtype=a.dtype))
+
+
+def test_write_overwrites(s3_base):
+    bucket_name = "test_write_overwrites"
+    object_name = "obj"
+    with s3_context(
+        s3_base=s3_base, bucket=bucket_name, files={object_name: b"old content"}
+    ) as server_address:
+        with kvikio.RemoteFile.open_s3(bucket_name, object_name) as f:
+            assert f.nbytes() == len(b"old content")
+            assert f.write(b"new") == 3
+            assert f.nbytes() == 3
+
+        client = boto3.client("s3", endpoint_url=server_address)
+        assert (
+            client.get_object(Bucket=bucket_name, Key=object_name)["Body"].read()
+            == b"new"
+        )
+
+
+def test_write_open_auto_without_probe(s3_base):
+    bucket_name = "test_write_open_auto"
+    object_name = "new-object"
+    with s3_context(s3_base=s3_base, bucket=bucket_name):
+        # Without nbytes, AUTO mode probes the object, which does not exist yet.
+        with pytest.raises(RuntimeError):
+            kvikio.RemoteFile.open(f"s3://{bucket_name}/{object_name}")
+
+        # A public S3 endpoint is read-only.
+        with kvikio.RemoteFile.open_s3_public(
+            f"http://{bucket_name}.s3.us-east-1.amazonaws.com/{object_name}", nbytes=0
+        ) as f:
+            with pytest.raises(RuntimeError, match="does not support writes"):
+                f.write(b"data")
+
+        with kvikio.RemoteFile.open(f"s3://{bucket_name}/{object_name}", nbytes=0) as f:
+            assert f.remote_endpoint_type() == kvikio.RemoteEndpointType.S3
+            assert f.write(b"data") == 4

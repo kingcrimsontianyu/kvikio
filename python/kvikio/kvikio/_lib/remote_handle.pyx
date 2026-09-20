@@ -15,6 +15,7 @@ from libcpp.string cimport string
 from libcpp.utility cimport move, pair
 from libcpp.vector cimport vector
 
+from kvikio._lib import defaults
 from kvikio._lib.arr cimport parse_buffer_argument
 from kvikio._lib.future cimport IOFuture, _wrap_io_future, future
 
@@ -81,6 +82,15 @@ cdef extern from "<kvikio/remote_handle.hpp>" namespace "kvikio" nogil:
             void* buf,
             size_t size,
             size_t file_offset
+        ) except +
+        size_t write(
+            const void* buf,
+            size_t size
+        ) except +
+        future[size_t] pwrite(
+            const void* buf,
+            size_t size,
+            size_t task_size
         ) except +
 
         @staticmethod
@@ -443,6 +453,32 @@ cdef class RemoteFile:
                 <void*>info.first,
                 info.second,
                 cpp_file_offset,
+            )
+
+        return _wrap_io_future(fut)
+
+    def write(self, buf, size: Optional[int]) -> int:
+        cdef pair[uintptr_t, size_t] info = parse_buffer_argument(buf, size, True)
+        cdef size_t result
+
+        with nogil:
+            result = deref(self._handle).write(
+                <const void*>info.first,
+                info.second,
+            )
+
+        return result
+
+    def pwrite(self, buf, size: Optional[int], task_size: Optional[int]) -> IOFuture:
+        cdef pair[uintptr_t, size_t] info = parse_buffer_argument(buf, size, True)
+        cdef size_t cpp_task_size = task_size if task_size else defaults.task_size()
+        cdef future[size_t] fut
+
+        with nogil:
+            fut = deref(self._handle).pwrite(
+                <const void*>info.first,
+                info.second,
+                cpp_task_size,
             )
 
         return _wrap_io_future(fut)

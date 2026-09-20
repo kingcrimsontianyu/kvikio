@@ -26,10 +26,13 @@
 #include <kvikio/detail/observation_recorder.hpp>
 #include <kvikio/detail/parallel_operation.hpp>
 #include <kvikio/detail/remote_callback.hpp>
+#include <kvikio/detail/remote_upload.hpp>
 #include <kvikio/detail/stream.hpp>
 #include <kvikio/detail/url.hpp>
 #include <kvikio/error.hpp>
 #include <kvikio/hdfs.hpp>
+#include <kvikio/logger.hpp>
+#include <kvikio/logger_macros.hpp>
 #include <kvikio/remote_handle.hpp>
 #include <kvikio/shim/libcurl.hpp>
 #include <kvikio/statistics/counters.hpp>
@@ -203,6 +206,155 @@ bool is_read_out_of_bounds(std::size_t file_offset, std::size_t size, std::size_
   return file_offset > nbytes || size > nbytes - file_offset;
 }
 
+// S3 limits on uploads. See
+// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>.
+constexpr std::size_t s3_max_single_put_size = std::size_t{5} << 30;  // 5 GiB
+constexpr std::size_t s3_min_part_size       = std::size_t{5} << 20;  // 5 MiB
+constexpr std::size_t s3_max_num_parts       = 10000;
+
+/**
+ * @brief Set up an upload request with a body of `size` bytes.
+ *
+ * The body length is sent as Content-Length. Without it libcurl would use chunked transfer
+ * encoding, which S3 rejects.
+ */
+void setup_upload_request_impl(CurlHandle& curl, std::size_t size)
+{
+  curl.setopt(CURLOPT_UPLOAD, 1L);
+  curl.setopt(CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(size));
+}
+
+/**
+ * @brief Percent-encode a string for use in a URL query.
+ */
+std::string url_encode(CurlHandle& curl, std::string const& value)
+{
+  std::unique_ptr<char, decltype(&curl_free)> const encoded{
+    curl_easy_escape(curl.handle(), value.c_str(), static_cast<int>(value.size())), curl_free};
+  KVIKIO_EXPECT(encoded != nullptr, "curl_easy_escape() failed", std::runtime_error);
+  return std::string{encoded.get()};
+}
+
+/**
+ * @brief Throw unless the last response of `curl` had a 2xx status.
+ *
+ * `CURLOPT_FAILONERROR` only rejects 4xx and 5xx. S3 answers a request sent to the wrong regional
+ * endpoint with a 301 and no body, which would otherwise pass as a successful write.
+ *
+ * @param curl The curl handle after `perform()`.
+ * @param what Description of the request for the error message.
+ * @param response The response body, included in the error message.
+ */
+void expect_2xx(CurlHandle& curl, std::string const& what, std::string const& response)
+{
+  long http_code = 0;
+  curl.getinfo(CURLINFO_RESPONSE_CODE, &http_code);
+  if (http_code >= 200 && http_code < 300) { return; }
+  std::stringstream ss;
+  ss << what << " failed with HTTP status " << http_code;
+  if (!response.empty()) { ss << ": " << response; }
+  KVIKIO_FAIL(ss.str(), std::runtime_error);
+}
+
+/**
+ * @brief Owner of a libcurl header list.
+ */
+class CurlHeaderList {
+  curl_slist* _list{nullptr};
+
+ public:
+  CurlHeaderList()                                 = default;
+  CurlHeaderList(CurlHeaderList const&)            = delete;
+  CurlHeaderList& operator=(CurlHeaderList const&) = delete;
+  ~CurlHeaderList() noexcept { curl_slist_free_all(_list); }
+
+  void append(char const* header)
+  {
+    auto* list = curl_slist_append(_list, header);
+    KVIKIO_EXPECT(list != nullptr, "curl_slist_append() failed", std::runtime_error);
+    _list = list;
+  }
+
+  [[nodiscard]] curl_slist* get() const noexcept { return _list; }
+};
+
+/**
+ * @brief Send a POST request whose URL is already set and return the response body.
+ *
+ * @param curl The curl handle.
+ * @param body Request body. An empty string still sends a body of length zero.
+ * @param base_headers Headers the endpoint already needs, such as the session token. May be null.
+ */
+std::string perform_post(CurlHandle& curl,
+                         std::string const& body,
+                         curl_slist const* base_headers,
+                         std::string const& what)
+{
+  // Libcurl would otherwise label the body as a URL-encoded form, which some servers then parse as
+  // one and leave the raw body empty.
+  CurlHeaderList headers;
+  for (auto const* node = base_headers; node != nullptr; node = node->next) {
+    headers.append(node->data);
+  }
+  headers.append("Content-Type: application/xml");
+  curl.setopt(CURLOPT_HTTPHEADER, headers.get());
+
+  curl.setopt(CURLOPT_POST, 1L);
+  curl.setopt(CURLOPT_POSTFIELDS, body.c_str());
+  curl.setopt(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+  std::string response;
+  curl.setopt(CURLOPT_WRITEDATA, static_cast<void*>(&response));
+  curl.setopt(CURLOPT_WRITEFUNCTION, detail::callback_get_string_response);
+  curl.perform([&response] { response.clear(); });
+  expect_2xx(curl, what, response);
+  return response;
+}
+
+/**
+ * @brief Upload the body of a request whose URL and method are already set.
+ *
+ * @param curl The curl handle.
+ * @param buf Pointer to host or device memory.
+ * @param size Number of bytes to upload.
+ * @param is_host_mem Whether `buf` is host memory.
+ * @return The ETag response header, including its quotes. Empty if the server sent none.
+ */
+std::string perform_upload(CurlHandle& curl, void const* buf, std::size_t size, bool is_host_mem)
+{
+  detail::UploadContext ctx{buf, size};
+  curl.setopt(CURLOPT_READDATA, static_cast<void*>(&ctx));
+  curl.setopt(CURLOPT_SEEKDATA, static_cast<void*>(&ctx));
+  curl.setopt(CURLOPT_SEEKFUNCTION, detail::callback_seek_upload);
+
+  std::string etag;
+  curl.setopt(CURLOPT_HEADERDATA, static_cast<void*>(&etag));
+  curl.setopt(CURLOPT_HEADERFUNCTION, detail::callback_header_etag);
+
+  // The response body is an XML error message at most. It must still be consumed, or libcurl
+  // prints it to stdout.
+  std::string response;
+  curl.setopt(CURLOPT_WRITEDATA, static_cast<void*>(&response));
+  curl.setopt(CURLOPT_WRITEFUNCTION, detail::callback_get_string_response);
+
+  auto const on_retry = [&] {
+    ctx.reset_for_retry();
+    etag.clear();
+    response.clear();
+  };
+  if (is_host_mem) {
+    curl.setopt(CURLOPT_READFUNCTION, detail::callback_read_host_memory);
+    curl.perform(on_retry);
+  } else {
+    PushAndPopContext c(get_context_from_pointer(buf));
+    detail::BounceBufferD2H bounce_buffer(detail::StreamCachePerThreadAndContext::get(), buf, size);
+    ctx.bounce_buffer = &bounce_buffer;
+    curl.setopt(CURLOPT_READFUNCTION, detail::callback_read_device_memory);
+    curl.perform(on_retry);
+  }
+  expect_2xx(curl, "upload", response);
+  return etag;
+}
+
 /**
  * @brief Whether the given URL is compatible with the S3 endpoint (including the credential-based
  * access and presigned URL) which uses HTTP/HTTPS.
@@ -344,6 +496,13 @@ RemoteEndpoint::RemoteEndpoint(RemoteEndpointType remote_endpoint_type)
 RemoteEndpointType RemoteEndpoint::remote_endpoint_type() const noexcept
 {
   return _remote_endpoint_type;
+}
+
+void RemoteEndpoint::setup_upload_request(CurlHandle& curl, std::size_t size)
+{
+  KVIKIO_FAIL(std::string{get_remote_endpoint_type_name(_remote_endpoint_type)} +
+                " endpoint does not support writes (" + str() + ")",
+              std::runtime_error);
 }
 
 HttpEndpoint::HttpEndpoint(std::string url)
@@ -517,6 +676,88 @@ void S3Endpoint::setup_range_request(CurlHandle& curl, std::size_t file_offset, 
 {
   KVIKIO_NVTX_FUNC_RANGE();
   setup_range_request_impl(curl, file_offset, size);
+}
+
+void S3Endpoint::setup_upload_request(CurlHandle& curl, std::size_t size)
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+  setup_upload_request_impl(curl, size);
+}
+
+std::string S3Endpoint::create_multipart_upload()
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+  auto curl = create_curl_handle();
+  setopt(curl);
+  auto const url = encode_special_chars_in_path(_url) + "?uploads";
+  curl.setopt(CURLOPT_URL, url.c_str());
+  auto const response =
+    perform_post(curl, "", _curl_header_list, "S3: CreateMultipartUpload of " + _url);
+
+  std::regex static const pattern(R"(<UploadId>([^<]+)</UploadId>)");
+  std::smatch match_result;
+  KVIKIO_EXPECT(std::regex_search(response, match_result, pattern),
+                "S3: no upload id in the CreateMultipartUpload response of " + _url,
+                std::runtime_error);
+  return match_result[1].str();
+}
+
+void S3Endpoint::setup_upload_part_request(CurlHandle& curl,
+                                           std::string const& upload_id,
+                                           std::size_t part_number,
+                                           std::size_t size)
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+  auto const url = encode_special_chars_in_path(_url) +
+                   "?partNumber=" + std::to_string(part_number) +
+                   "&uploadId=" + url_encode(curl, upload_id);
+  curl.setopt(CURLOPT_URL, url.c_str());
+  setup_upload_request_impl(curl, size);
+}
+
+void S3Endpoint::complete_multipart_upload(std::string const& upload_id,
+                                           std::vector<std::string> const& etags)
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+  auto curl = create_curl_handle();
+  setopt(curl);
+  auto const url = encode_special_chars_in_path(_url) + "?uploadId=" + url_encode(curl, upload_id);
+  curl.setopt(CURLOPT_URL, url.c_str());
+
+  std::stringstream body;
+  body << "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
+  for (std::size_t i = 0; i < etags.size(); ++i) {
+    body << "<Part><PartNumber>" << i + 1 << "</PartNumber><ETag>" << etags[i] << "</ETag></Part>";
+  }
+  body << "</CompleteMultipartUpload>";
+  auto const response =
+    perform_post(curl, body.str(), _curl_header_list, "S3: CompleteMultipartUpload of " + _url);
+
+  // S3 may answer CompleteMultipartUpload with status 200 and an error in the body. See
+  // <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html>.
+  KVIKIO_EXPECT(response.find("<Error>") == std::string::npos,
+                "S3: CompleteMultipartUpload of " + _url + " failed: " + response,
+                std::runtime_error);
+}
+
+void S3Endpoint::abort_multipart_upload(std::string const& upload_id) noexcept
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+  try {
+    auto curl = create_curl_handle();
+    setopt(curl);
+    auto const url =
+      encode_special_chars_in_path(_url) + "?uploadId=" + url_encode(curl, upload_id);
+    curl.setopt(CURLOPT_URL, url.c_str());
+    curl.setopt(CURLOPT_CUSTOMREQUEST, "DELETE");
+    std::string response;
+    curl.setopt(CURLOPT_WRITEDATA, static_cast<void*>(&response));
+    curl.setopt(CURLOPT_WRITEFUNCTION, detail::callback_get_string_response);
+    curl.perform([&response] { response.clear(); });
+  } catch (std::exception const& e) {
+    KVIKIO_LOG_WARN("S3: AbortMultipartUpload of " + _url +
+                    " failed, parts may linger: " + e.what());
+  }
 }
 
 bool S3Endpoint::is_url_valid(std::string const& url) noexcept
@@ -700,7 +941,9 @@ RemoteHandle RemoteHandle::open(std::string const& url,
   std::optional<std::size_t> probed_nbytes;
 
   if (remote_endpoint_type == RemoteEndpointType::AUTO) {
-    auto inferred = infer_endpoint_impl(url, allow_list.value(), true);
+    // A caller who knows the size does not need the connectivity probe. This also lets an object
+    // that does not exist yet be opened for writing.
+    auto inferred = infer_endpoint_impl(url, allow_list.value(), !nbytes.has_value());
     endpoint      = std::move(inferred.first);
     probed_nbytes = inferred.second;
   } else {
@@ -1038,5 +1281,166 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
                       return n;
                     });
 }
+
+std::size_t RemoteHandle::write(void const* buf, std::size_t size)
+{
+  KVIKIO_NVTX_FUNC_RANGE(size);
+  KVIKIO_EXPECT(size <= s3_max_single_put_size,
+                "cannot write more than 5 GiB in a single request, use pwrite()",
+                std::invalid_argument);
+
+  detail::expect_not_in_monitor();
+  bool const is_host_mem = is_host_memory(buf);
+  detail::LogicalObservationRecorder recorder{remote_io_backend_of(*_endpoint),
+                                              TransferDirection::WRITE,
+                                              is_host_mem ? MemoryKind::HOST : MemoryKind::DEVICE,
+                                              0,
+                                              size,
+                                              _source,
+                                              "PUT"};
+  detail::PhysicalObservationContext const physical{
+    .backend     = remote_io_backend_of(*_endpoint),
+    .direction   = TransferDirection::WRITE,
+    .memory_kind = is_host_mem ? MemoryKind::HOST : MemoryKind::DEVICE,
+    .parent_id   = recorder.id(),
+    .source      = _source,
+    .http_method = "PUT"};
+  detail::PhysicalObservationRecorder physical_recorder{physical, 0, size};
+  auto const nbytes = write_impl(buf, size, is_host_mem);
+  physical_recorder.finish(nbytes);
+  recorder.finish(nbytes);
+  return nbytes;
+}
+
+std::size_t RemoteHandle::write_impl(void const* buf, std::size_t size, bool is_host_mem)
+{
+  auto curl = create_curl_handle();
+  _endpoint->setopt(curl);
+  _endpoint->setup_upload_request(curl, size);
+  perform_upload(curl, buf, size, is_host_mem);
+  _nbytes = size;
+  return size;
+}
+
+std::future<std::size_t> RemoteHandle::pwrite(void const* buf,
+                                              std::size_t size,
+                                              std::size_t task_size,
+                                              ThreadPool* thread_pool)
+{
+  KVIKIO_NVTX_FUNC_RANGE(size);
+  KVIKIO_EXPECT(task_size > 0, "`task_size` must be positive", std::invalid_argument);
+  KVIKIO_EXPECT(thread_pool != nullptr, "The thread pool must not be nullptr");
+
+  detail::expect_not_in_monitor();
+  bool const is_host_mem = is_host_memory(buf);
+  auto const part_size   = detail::s3_multipart_part_size(size, task_size);
+  auto* s3_endpoint      = dynamic_cast<S3Endpoint*>(_endpoint.get());
+
+  auto recorder = detail::monitoring_enabled(ObservationKind::LOGICAL)
+                    ? std::make_shared<detail::LogicalObservationRecorder>(
+                        remote_io_backend_of(*_endpoint),
+                        TransferDirection::WRITE,
+                        is_host_mem ? MemoryKind::HOST : MemoryKind::DEVICE,
+                        0,
+                        size,
+                        _source,
+                        "PUT")
+                    : nullptr;
+  detail::PhysicalObservationContext const physical{
+    .backend     = remote_io_backend_of(*_endpoint),
+    .direction   = TransferDirection::WRITE,
+    .memory_kind = is_host_mem ? MemoryKind::HOST : MemoryKind::DEVICE,
+    .parent_id   = recorder ? recorder->id() : std::nullopt,
+    .source      = _source,
+    .http_method = "PUT"};
+  auto& [nvtx_color, call_idx] = detail::get_next_color_and_call_idx();
+  detail::TaskOptions const task_options{
+    .thread_pool = thread_pool, .nvtx_payload = call_idx, .nvtx_color = nvtx_color};
+
+  // One part covers the buffer, or the endpoint has no multipart upload. Send one request. For a
+  // read-only endpoint this is where the error surfaces.
+  if (part_size >= size || s3_endpoint == nullptr) {
+    auto task = [this, buf, size, is_host_mem, physical, recorder]() -> std::size_t {
+      try {
+        detail::PhysicalObservationRecorder physical_recorder{physical, 0, size};
+        auto const nbytes = write_impl(buf, size, is_host_mem);
+        physical_recorder.finish(nbytes);
+        if (recorder) { recorder->finish(nbytes); }
+        return nbytes;
+      } catch (...) {
+        if (recorder) { recorder->finish_with_failure(); }
+        throw;
+      }
+    };
+    return detail::submit_move_only_task(std::move(task), task_options);
+  }
+
+  // Multipart upload. The upload is started on the calling thread, since every part needs the
+  // upload id before it can start. Each part is one task. A final task waits for the parts, then
+  // completes or aborts the upload. It is submitted last, so with a single worker thread it runs
+  // after the parts and cannot starve them.
+  auto const upload_id        = s3_endpoint->create_multipart_upload();
+  std::size_t const num_parts = (size + part_size - 1) / part_size;
+
+  std::vector<std::future<std::string>> etags;
+  etags.reserve(num_parts);
+  auto const* src = static_cast<char const*>(buf);
+  for (std::size_t i = 0; i < num_parts; ++i) {
+    std::size_t const offset      = i * part_size;
+    std::size_t const nbytes_part = std::min(part_size, size - offset);
+    etags.push_back(thread_pool->submit_task([=, &nvtx_color]() -> std::string {
+      KVIKIO_NVTX_SCOPED_RANGE("task", call_idx, nvtx_color);
+      detail::PhysicalObservationRecorder physical_recorder{physical, offset, nbytes_part};
+      auto curl = create_curl_handle();
+      s3_endpoint->setopt(curl);
+      s3_endpoint->setup_upload_part_request(curl, upload_id, i + 1, nbytes_part);
+      auto etag = perform_upload(curl, src + offset, nbytes_part, is_host_mem);
+      physical_recorder.finish(nbytes_part);
+      return etag;
+    }));
+  }
+
+  auto last_task =
+    [this, size, upload_id, s3_endpoint, recorder, etags = std::move(etags)]() mutable
+    -> std::size_t {
+    // Wait for every part before deciding, so no part is still reading the caller's buffer when
+    // the future completes.
+    std::vector<std::string> collected;
+    collected.reserve(etags.size());
+    std::exception_ptr first_error;
+    for (auto& fut : etags) {
+      try {
+        collected.push_back(fut.get());
+      } catch (...) {
+        if (!first_error) { first_error = std::current_exception(); }
+      }
+    }
+    try {
+      if (first_error) { std::rethrow_exception(first_error); }
+      s3_endpoint->complete_multipart_upload(upload_id, collected);
+    } catch (...) {
+      s3_endpoint->abort_multipart_upload(upload_id);
+      if (recorder) { recorder->finish_with_failure(); }
+      throw;
+    }
+    _nbytes = size;
+    if (recorder) { recorder->finish(size); }
+    return size;
+  };
+  return detail::submit_move_only_task(std::move(last_task), task_options);
+}
+
+namespace detail {
+
+std::size_t s3_multipart_part_size(std::size_t size, std::size_t task_size)
+{
+  KVIKIO_EXPECT(task_size > 0, "`task_size` must be positive", std::invalid_argument);
+  auto part_size = std::max(task_size, s3_min_part_size);
+  // Fewest bytes per part that still covers the object in at most `s3_max_num_parts` parts.
+  auto const min_for_part_count = (size + s3_max_num_parts - 1) / s3_max_num_parts;
+  return std::max(part_size, min_for_part_count);
+}
+
+}  // namespace detail
 
 }  // namespace kvikio

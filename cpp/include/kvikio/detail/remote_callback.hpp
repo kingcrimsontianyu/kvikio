@@ -5,12 +5,19 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
+
+#include <curl/curl.h>
 
 namespace kvikio::detail {
 
 // Defined in cpp/src/remote_handle.cpp. Only used by callback_device_memory(). The host path leaves
 // CallbackContext::bounce_buffer as nullptr.
 class BounceBufferH2D;
+
+// Defined in cpp/src/remote_handle.cpp. Only used by callback_read_device_memory(). The host path
+// leaves UploadContext::bounce_buffer as nullptr.
+class BounceBufferD2H;
 
 /**
  * @brief Context used by the libcurl CURLOPT_WRITEFUNCTION callbacks for remote reads.
@@ -107,4 +114,82 @@ std::size_t callback_get_string_response(char* data,
                                          std::size_t size,
                                          std::size_t num_bytes,
                                          void* userdata);
+
+/**
+ * @brief Context used by the libcurl `CURLOPT_READFUNCTION` callbacks for remote writes.
+ *
+ * One instance per upload request. Exactly one of `buf` or `bounce_buffer` is the live source:
+ * - `callback_read_host_memory`: reads from `buf`.
+ * - `callback_read_device_memory`: reads device memory staged through `bounce_buffer`.
+ */
+struct UploadContext {
+  char const* buf{nullptr};  ///< Host source buffer (used by `callback_read_host_memory`).
+  std::size_t size{0};       ///< Total number of bytes to upload.
+  std::size_t offset{0};     ///< Bytes handed to libcurl so far.
+  BounceBufferD2H* bounce_buffer{nullptr};  ///< Used by `callback_read_device_memory`.
+
+  UploadContext(void const* buf, std::size_t size) : buf{static_cast<char const*>(buf)}, size{size}
+  {
+  }
+
+  /**
+   * @brief Rewind to the start of the source for a retry.
+   */
+  void reset_for_retry() noexcept;
+};
+
+/**
+ * @brief Callback for `CURLOPT_READFUNCTION` that copies the next bytes of a host buffer into
+ * libcurl's upload buffer.
+ *
+ * @param dst Libcurl-owned buffer to fill.
+ * @param size Size of each element (always 1 per libcurl convention).
+ * @param nmemb Capacity of `dst` in bytes.
+ * @param context Pointer to an `UploadContext` with a non-null `buf`.
+ * @return Number of bytes copied. Zero signals the end of the body.
+ */
+std::size_t callback_read_host_memory(char* dst,
+                                      std::size_t size,
+                                      std::size_t nmemb,
+                                      void* context);
+
+/**
+ * @brief Callback for `CURLOPT_READFUNCTION` that copies the next bytes of a device buffer, staged
+ * through a pinned host bounce buffer, into libcurl's upload buffer.
+ *
+ * @param dst Libcurl-owned buffer to fill.
+ * @param size Size of each element (always 1 per libcurl convention).
+ * @param nmemb Capacity of `dst` in bytes.
+ * @param context Pointer to an `UploadContext` with a non-null `bounce_buffer`.
+ * @return Number of bytes copied. Zero signals the end of the body.
+ */
+std::size_t callback_read_device_memory(char* dst,
+                                        std::size_t size,
+                                        std::size_t nmemb,
+                                        void* context);
+
+/**
+ * @brief Callback for `CURLOPT_SEEKFUNCTION` that repositions an upload, so libcurl can resend the
+ * body after a redirect or an authentication round trip.
+ *
+ * @param context Pointer to an `UploadContext`.
+ * @param offset New position in bytes from the start of the body.
+ * @param origin Must be `SEEK_SET`.
+ * @return `CURL_SEEKFUNC_OK`, or `CURL_SEEKFUNC_CANTSEEK` for an unsupported origin.
+ */
+int callback_seek_upload(void* context, curl_off_t offset, int origin);
+
+/**
+ * @brief Callback for `CURLOPT_HEADERFUNCTION` that stores the value of the `ETag` response header.
+ *
+ * @param data Header line, not null-terminated.
+ * @param size Size of each element (always 1 per libcurl convention).
+ * @param num_bytes Length of the header line.
+ * @param userdata Must be cast from `std::string*`. Receives the ETag including its quotes.
+ * @return The number of bytes consumed by the callback.
+ */
+std::size_t callback_header_etag(char* data,
+                                 std::size_t size,
+                                 std::size_t num_bytes,
+                                 void* userdata);
 }  // namespace kvikio::detail

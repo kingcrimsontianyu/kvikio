@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -379,7 +379,9 @@ class RemoteFile:
             :class:`RemoteEndpointType.WEBHDFS`, and :class:`RemoteEndpointType.HTTP`.
         nbytes : int, optional
             File size in bytes. If not provided, the function sends an additional
-            request to the server to query the file size.
+            request to the server to query the file size. Providing it also skips
+            the S3 connectivity probe of AUTO mode, so an object that does not exist
+            yet can be opened for writing.
 
         Returns
         -------
@@ -474,7 +476,8 @@ class RemoteFile:
     def nbytes(self) -> int:
         """Get the file size.
 
-        Note, this is very fast, no communication needed.
+        Note, this is very fast, no communication needed. A completed write updates
+        the size.
 
         Returns
         -------
@@ -518,3 +521,57 @@ class RemoteFile:
         read.
         """
         return IOFuture(self._handle.pread(buf, size, file_offset))
+
+    def write(self, buf, size: Optional[int] = None) -> int:
+        """Replace the remote file with the content of a buffer (host or device
+        memory) in parallel.
+
+        Only S3 files opened with credentials support writes. S3 has no byte-range
+        writes, so there is no file offset. See :meth:`pwrite` for how the upload is
+        split.
+
+        Parameters
+        ----------
+        buf : buffer-like or array-like
+            Device or host buffer to write from.
+        size
+            Size in bytes to write.
+
+        Returns
+        -------
+        The size of bytes that were successfully written.
+        """
+        return self.pwrite(buf, size).get()
+
+    def pwrite(
+        self, buf, size: Optional[int] = None, task_size: Optional[int] = None
+    ) -> IOFuture:
+        """Replace the remote file with the content of a buffer (host or device
+        memory) in parallel.
+
+        The buffer is split into parts of ``task_size`` bytes, each uploaded by a
+        thread of the default thread pool as one part of an S3 multipart upload. S3
+        requires every part but the last to be at least 5 MiB and allows at most
+        10,000 parts, so the part size is raised above ``task_size`` when needed.
+        When a single part covers the buffer, one PUT request is used instead. If
+        any part fails, the multipart upload is aborted and the future raises the
+        first error.
+
+        Writes always run in the thread pool. The ``KVIKIO_REMOTE_IO_BACKEND``
+        setting only applies to reads.
+
+        Parameters
+        ----------
+        buf : buffer-like or array-like
+            Device or host buffer to write from.
+        size
+            Size in bytes to write.
+        task_size : int, default=kvikio.defaults.task_size()
+            Requested size of each part in bytes.
+
+        Returns
+        -------
+        Future that on completion returns the size of bytes that were successfully
+        written.
+        """
+        return IOFuture(self._handle.pwrite(buf, size, task_size))

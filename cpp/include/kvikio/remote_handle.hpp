@@ -131,6 +131,19 @@ class RemoteEndpoint {
   virtual void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) = 0;
 
   /**
+   * @brief Set up a request that replaces the whole remote file with `size` bytes.
+   *
+   * The caller wires up the body through `CURLOPT_READFUNCTION` afterwards. The default
+   * implementation throws, since most endpoints are read-only.
+   *
+   * @param curl The curl handle.
+   * @param size Number of bytes that will be uploaded.
+   *
+   * @exception std::runtime_error if the endpoint does not support writes.
+   */
+  virtual void setup_upload_request(CurlHandle& curl, std::size_t size);
+
+  /**
    * @brief Get the type of the remote file.
    *
    * @return The type of the remote file.
@@ -265,6 +278,47 @@ class S3Endpoint : public RemoteEndpoint {
   std::string str() const override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
+  void setup_upload_request(CurlHandle& curl, std::size_t size) override;
+
+  /**
+   * @brief Start a multipart upload that will replace the object.
+   *
+   * @return The upload id that the part, complete and abort requests refer to.
+   */
+  std::string create_multipart_upload();
+
+  /**
+   * @brief Set up the request that uploads one part of a multipart upload.
+   *
+   * The caller wires up the body through `CURLOPT_READFUNCTION` afterwards.
+   *
+   * @param curl The curl handle.
+   * @param upload_id The id returned by `create_multipart_upload()`.
+   * @param part_number Position of the part in the object, counted from 1.
+   * @param size Number of bytes in the part.
+   */
+  void setup_upload_part_request(CurlHandle& curl,
+                                 std::string const& upload_id,
+                                 std::size_t part_number,
+                                 std::size_t size);
+
+  /**
+   * @brief Assemble the uploaded parts into the object.
+   *
+   * @param upload_id The id returned by `create_multipart_upload()`.
+   * @param etags The ETag response header of each part, in part order.
+   */
+  void complete_multipart_upload(std::string const& upload_id,
+                                 std::vector<std::string> const& etags);
+
+  /**
+   * @brief Discard the uploaded parts of a failed multipart upload.
+   *
+   * Failures are logged, not thrown, since this runs while another error is being reported.
+   *
+   * @param upload_id The id returned by `create_multipart_upload()`.
+   */
+  void abort_multipart_upload(std::string const& upload_id) noexcept;
 
   /**
    * @brief Whether the given URL is valid for S3 endpoints (excluding presigned URL).
@@ -381,7 +435,8 @@ class RemoteHandle {
    * RemoteEndpointType::S3_PRESIGNED_URL, RemoteEndpointType::WEBHDFS, and
    * RemoteEndpointType::HTTP.
    * @param nbytes Optional file size in bytes. If not provided, the function sends additional
-   * request to the server to query the file size.
+   * request to the server to query the file size. Providing it also skips the S3 connectivity
+   * probe of AUTO mode, so an object that does not exist yet can be opened for writing.
    * @return A RemoteHandle object that can be used to read data from the remote file.
    * @exception std::runtime_error If:
    *   - If the URL is malformed or missing required components.
@@ -530,6 +585,51 @@ class RemoteHandle {
                                  std::size_t task_size   = defaults::task_size(),
                                  ThreadPool* thread_pool = &defaults::thread_pool());
 
+  /**
+   * @brief Replace the remote file with the content of a buffer (host or device memory).
+   *
+   * Only S3 endpoints with credentials support writes. S3 has no byte-range writes, so there is
+   * no file offset. The whole object is sent in one PUT request. On success `nbytes()` reports the
+   * new size.
+   *
+   * @param buf Pointer to host or device memory.
+   * @param size Number of bytes to write. At most 5 GiB, the S3 limit of a single PUT.
+   * @return Number of bytes written, which is always `size`.
+   *
+   * @exception std::runtime_error if the endpoint does not support writes.
+   */
+  std::size_t write(void const* buf, std::size_t size);
+
+  /**
+   * @brief Replace the remote file with the content of a buffer, in parallel.
+   *
+   * The parallel async counterpart of `write()`. The buffer is split into parts of `task_size`
+   * bytes, each uploaded by a worker of `thread_pool` as one part of an S3 multipart upload. S3
+   * requires every part but the last to be at least 5 MiB and allows at most 10,000 parts, so the
+   * part size is raised above `task_size` when needed. See `detail::s3_multipart_part_size()`.
+   * When a single part covers the buffer, one PUT request is used instead.
+   *
+   * Writes always run in the thread pool. `KVIKIO_REMOTE_IO_BACKEND` only applies to reads.
+   *
+   * @param buf Pointer to host or device memory.
+   * @param size Number of bytes to write.
+   * @param task_size Requested size of each part in bytes.
+   * @param thread_pool Thread pool to use. Defaults to the global default thread pool. The caller
+   * is responsible for keeping the thread pool valid until the returned future is consumed.
+   * @return Future that on completion returns the number of bytes written, which is always `size`.
+   * If any part fails, the multipart upload is aborted and the future rethrows the first error.
+   *
+   * @note The returned `std::future` must not outlive the `RemoteHandle` or the `thread_pool`.
+   * Calling `wait()` or `get()` on the future after either has been destroyed results in undefined
+   * behavior.
+   *
+   * @exception std::runtime_error if the endpoint does not support writes.
+   */
+  std::future<std::size_t> pwrite(void const* buf,
+                                  std::size_t size,
+                                  std::size_t task_size   = defaults::task_size(),
+                                  ThreadPool* thread_pool = &defaults::thread_pool());
+
  private:
   /**
    * @brief Throw if `[file_offset, file_offset + size)` reaches past the end of the remote object.
@@ -543,6 +643,25 @@ class RemoteHandle {
 
   /// The read itself, without what the public `read()` wraps around it.
   std::size_t read_impl(void* buf, std::size_t size, std::size_t file_offset, bool is_host_mem);
+
+  /// The single-request write itself, without what the public `write()` wraps around it.
+  std::size_t write_impl(void const* buf, std::size_t size, bool is_host_mem);
 };
+
+namespace detail {
+
+/**
+ * @brief Size of each part of an S3 multipart upload.
+ *
+ * Starts from `task_size` and raises it to satisfy the S3 rules: every part but the last must be at
+ * least 5 MiB, and an upload has at most 10,000 parts.
+ *
+ * @param size Number of bytes in the object.
+ * @param task_size Requested part size in bytes. Must be positive.
+ * @return The part size in bytes.
+ */
+[[nodiscard]] std::size_t s3_multipart_part_size(std::size_t size, std::size_t task_size);
+
+}  // namespace detail
 
 }  // namespace kvikio
