@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
 #include <sstream>
@@ -27,6 +28,7 @@ namespace kvikio {
 // Forward declarations of the remote-IO selector enums.
 enum class RemoteIOBackend : uint8_t;
 enum class RemoteReactorDispatch : uint8_t;
+enum class RemoteDirectReceiveMode : uint8_t;
 
 template <typename T>
 T getenv_or(std::string_view env_var_name, T default_val)
@@ -61,6 +63,10 @@ RemoteIOBackend getenv_or(std::string_view env_var_name, RemoteIOBackend default
 
 template <>
 RemoteReactorDispatch getenv_or(std::string_view env_var_name, RemoteReactorDispatch default_val);
+
+template <>
+RemoteDirectReceiveMode getenv_or(std::string_view env_var_name,
+                                  RemoteDirectReceiveMode default_val);
 
 /**
  * @brief Get the environment variable value from a candidate list
@@ -137,6 +143,7 @@ class defaults {
   unsigned int _remote_io_num_reactors;
   RemoteReactorDispatch _remote_io_reactor_dispatch;
   std::size_t _remote_io_max_concurrent_requests;
+  RemoteDirectReceiveMode _remote_direct_receive_mode;
 
   static unsigned int get_num_threads_from_env();
 
@@ -564,6 +571,28 @@ class defaults {
    * @exception std::runtime_error if the `MULTI_POLL` reactor pool has already been created.
    */
   static void set_remote_io_max_concurrent_requests(std::size_t max_requests);
+
+  /**
+   * @brief Policy for the experimental remote direct receive path.
+   *
+   * Controlled by `KVIKIO_REMOTE_DIRECT_RECEIVE`, parsed case-insensitively as `OFF`, `PREFER`, or
+   * `REQUIRE`. Defaults to `OFF`. Direct receive currently applies to host-destination `pread()`
+   * calls under the `MULTI_POLL` backend.
+   *
+   * @return The direct receive policy.
+   */
+  [[nodiscard]] static RemoteDirectReceiveMode remote_direct_receive_mode();
+
+  /**
+   * @brief Set the remote direct receive policy at runtime, overriding
+   * `KVIKIO_REMOTE_DIRECT_RECEIVE`.
+   *
+   * Each `pread()` reads the policy once when it starts. Set it before starting concurrent remote
+   * I/O.
+   *
+   * @param mode The direct receive policy.
+   */
+  static void set_remote_direct_receive_mode(RemoteDirectReceiveMode mode);
 };
 
 }  // namespace kvikio

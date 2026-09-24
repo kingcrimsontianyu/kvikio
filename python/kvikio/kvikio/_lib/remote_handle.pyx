@@ -7,7 +7,8 @@
 from typing import Optional
 
 from cython.operator cimport dereference as deref
-from libc.stdint cimport uint8_t, uintptr_t
+from libc.stdint cimport uint8_t, uint64_t, uintptr_t
+from libcpp cimport bool
 from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.optional cimport nullopt, optional
 from libcpp.pair cimport pair
@@ -17,6 +18,32 @@ from libcpp.vector cimport vector
 
 from kvikio._lib.arr cimport parse_buffer_argument
 from kvikio._lib.future cimport IOFuture, _wrap_io_future, future
+
+
+cdef extern from "<kvikio/remote_direct_receive.hpp>" namespace "kvikio" nogil:
+    cdef struct cpp_RemoteDirectReceiveStats "kvikio::RemoteDirectReceiveStats":
+        uint64_t transfers_requested
+        uint64_t strict_rx_transfers_activated
+        uint64_t strict_rx_transfers_completed
+        uint64_t copied_stream_transfers_completed
+        uint64_t transfers_fallback
+        uint64_t fallback_capability_unavailable
+        uint64_t fallback_ineligible_request
+        uint64_t transfers_failed
+        uint64_t protocol_validation_failures
+        uint64_t retries
+        uint64_t strict_rx_raw_received_bytes
+        uint64_t strict_rx_body_bytes
+        uint64_t copied_stream_raw_received_bytes
+        uint64_t copied_stream_body_bytes
+        uint64_t direct_placement_bytes
+        uint64_t framing_compaction_bytes
+    bool cpp_remote_direct_receive_supported \
+        "kvikio::remote_direct_receive_supported"()
+    cpp_RemoteDirectReceiveStats cpp_remote_direct_receive_stats \
+        "kvikio::remote_direct_receive_stats"()
+    void cpp_reset_remote_direct_receive_stats \
+        "kvikio::reset_remote_direct_receive_stats"()
 
 
 cdef extern from "<kvikio/remote_handle.hpp>" namespace "kvikio" nogil:
@@ -454,3 +481,33 @@ def infer_remote_endpoint_type(url: str) -> RemoteEndpointType:
     with nogil:
         result = cpp_infer_remote_endpoint_type(cpp_url)
     return result
+
+
+def remote_direct_receive_supported() -> bool:
+    return cpp_remote_direct_receive_supported()
+
+
+def remote_direct_receive_stats() -> dict:
+    cdef cpp_RemoteDirectReceiveStats s = cpp_remote_direct_receive_stats()
+    return {
+        "transfers_requested": s.transfers_requested,
+        "strict_rx_transfers_activated": s.strict_rx_transfers_activated,
+        "strict_rx_transfers_completed": s.strict_rx_transfers_completed,
+        "copied_stream_transfers_completed": s.copied_stream_transfers_completed,
+        "transfers_fallback": s.transfers_fallback,
+        "fallback_capability_unavailable": s.fallback_capability_unavailable,
+        "fallback_ineligible_request": s.fallback_ineligible_request,
+        "transfers_failed": s.transfers_failed,
+        "protocol_validation_failures": s.protocol_validation_failures,
+        "retries": s.retries,
+        "strict_rx_raw_received_bytes": s.strict_rx_raw_received_bytes,
+        "strict_rx_body_bytes": s.strict_rx_body_bytes,
+        "copied_stream_raw_received_bytes": s.copied_stream_raw_received_bytes,
+        "copied_stream_body_bytes": s.copied_stream_body_bytes,
+        "direct_placement_bytes": s.direct_placement_bytes,
+        "framing_compaction_bytes": s.framing_compaction_bytes,
+    }
+
+
+def reset_remote_direct_receive_stats() -> None:
+    cpp_reset_remote_direct_receive_stats()

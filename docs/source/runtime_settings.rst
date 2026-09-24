@@ -125,6 +125,23 @@ Each cache holds one DNS result per host, which for S3 is a set of addresses dra
 
 Both variables are read only from the environment, and only when the caches are first used. Neither has any effect under ``MULTI_POLL``.
 
+Remote Direct Receive ``KVIKIO_REMOTE_DIRECT_RECEIVE``
+------------------------------------------------------
+
+Experimental. Controls whether a remote read lets libcurl receive the response body directly into the destination buffer, instead of into libcurl's own buffer followed by a copy. The accepted values (case-insensitive) are:
+
+  * ``OFF`` (default): Use the ordinary receive path.
+  * ``PREFER``: Use direct receive for eligible reads. Over HTTPS, request strict RX kTLS, so the Linux kernel decrypts TLS records straight into KvikIO's buffers. If strict RX kTLS is unavailable before any body byte arrives, the transfer retries through libcurl's ordinary TLS with the same buffers (the copied stream). Cleartext HTTP uses the copied stream from the start. Ineligible reads use the ordinary path.
+  * ``REQUIRE``: Fail an ineligible read, and fail any transfer where strict RX kTLS does not activate. Useful for benchmarks, which must not silently measure another path.
+
+A read is eligible when the backend is ``MULTI_POLL``, the destination is host memory, the endpoint is HTTP or S3 (not WebHDFS), and KvikIO was built against a libcurl that provides caller-owned receive buffers and strict RX kTLS. These are experimental libcurl extensions, not yet part of upstream curl. The libcurl that KvikIO fetches when none is installed provides them.
+
+For each range request, the response headers first land in a small window of 16 KiB, so HTTP framing never touches the destination. Only an exact HTTP/1.1 ``206`` response is accepted, with identity content encoding and ``Content-Length`` and ``Content-Range`` headers that match the requested range and the object size recorded when the file was opened. An HTTP/1.0 server is rejected. Once the headers pass, libcurl is lent the rest of the destination and the body lands at its final offset.
+
+For S3 endpoints every range response must carry the same strong ``ETag``, so one read cannot mix two versions of an object. Once the ``ETag`` is known, later requests send it in ``If-Match`` (except for presigned URLs), and a ``412`` response fails the read. Unlike the ordinary path, a read from an object that was overwritten after its first direct read therefore fails instead of returning the new data.
+
+C++ code can query and change the policy with ``kvikio::defaults::remote_direct_receive_mode()`` and ``kvikio::defaults::set_remote_direct_receive_mode()``. Each read uses the policy in effect when it starts. ``kvikio.remote_file.remote_direct_receive_stats()`` reports which path the transfers took.
+
 CA bundle file and CA directory ``CURL_CA_BUNDLE``, ``SSL_CERT_FILE``, ``SSL_CERT_DIR``
 ---------------------------------------------------------------------------------------
 

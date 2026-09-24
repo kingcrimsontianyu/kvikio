@@ -17,11 +17,13 @@
 #include <kvikio/threadpool_wrapper.hpp>
 #include <kvikio/utils.hpp>
 
-struct curl_slist;
-
 namespace kvikio {
 
 class CurlHandle;  // Prototype
+
+namespace detail {
+class DirectReceiveObjectSnapshot;
+}
 
 /**
  * @brief Types of remote file endpoints supported by KvikIO.
@@ -136,6 +138,46 @@ class RemoteEndpoint {
   virtual void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) = 0;
 
   /**
+   * @brief Whether `setup_range_request()` configures an exact HTTP byte-range request.
+   *
+   * Direct receive needs this stronger contract than the abstract range-request interface, because
+   * it accepts body bytes only after validating an exact HTTP 206 response. Custom endpoints stay
+   * ineligible unless they opt in.
+   *
+   * @return Whether direct receive may be used with this endpoint.
+   */
+  [[nodiscard]] virtual bool supports_exact_http_range() const noexcept { return false; }
+
+  /**
+   * @brief Whether the URL configured by `setopt()` uses TLS to the origin server.
+   *
+   * Separate from `str()`, which is a description and need not be the URL passed to libcurl.
+   *
+   * @return Whether requests use HTTPS.
+   */
+  [[nodiscard]] virtual bool uses_origin_tls() const noexcept { return false; }
+
+  /**
+   * @brief Whether direct receive must see one strong ETag on every range response.
+   *
+   * S3 reads require proof that all ranges come from one object version. Generic HTTP stays
+   * compatible with servers that implement exact ranges but send no validators.
+   *
+   * @return Whether an ETag is required.
+   */
+  [[nodiscard]] virtual bool direct_receive_requires_entity_tag() const noexcept { return false; }
+
+  /**
+   * @brief Whether a learned ETag may be sent as If-Match on later requests.
+   *
+   * A presigned S3 URL validates that responses converge on one ETag, but cannot add a header that
+   * its signature does not cover.
+   *
+   * @return Whether If-Match is sent.
+   */
+  [[nodiscard]] virtual bool direct_receive_sends_if_match() const noexcept { return false; }
+
+  /**
    * @brief Get the type of the remote file.
    *
    * @return The type of the remote file.
@@ -166,6 +208,8 @@ class HttpEndpoint : public RemoteEndpoint {
   std::string str() const override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
 
   /**
    * @brief Whether the given URL is valid for HTTP/HTTPS endpoints.
@@ -187,7 +231,8 @@ class S3Endpoint : public RemoteEndpoint {
   std::string _url;
   std::string _aws_sigv4;
   std::string _aws_userpwd;
-  curl_slist* _curl_header_list{};
+  // The `x-amz-security-token` header line of temporary credentials, if any.
+  std::optional<std::string> _session_token_header;
 
  public:
   /**
@@ -270,6 +315,10 @@ class S3Endpoint : public RemoteEndpoint {
   std::string str() const override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
+  [[nodiscard]] bool direct_receive_requires_entity_tag() const noexcept override;
+  [[nodiscard]] bool direct_receive_sends_if_match() const noexcept override;
 
   /**
    * @brief Whether the given URL is valid for S3 endpoints (excluding presigned URL).
@@ -298,6 +347,10 @@ class S3PublicEndpoint : public RemoteEndpoint {
   std::string str() const override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
+  [[nodiscard]] bool direct_receive_requires_entity_tag() const noexcept override;
+  [[nodiscard]] bool direct_receive_sends_if_match() const noexcept override;
 
   /**
    * @brief Whether the given URL is valid for S3 public endpoints.
@@ -326,6 +379,9 @@ class S3EndpointWithPresignedUrl : public RemoteEndpoint {
   std::string str() const override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
+  [[nodiscard]] bool direct_receive_requires_entity_tag() const noexcept override;
 
   /**
    * @brief Whether the given URL is valid for S3 endpoints with presigned URL.
@@ -358,6 +414,8 @@ class RemoteHandle {
   std::unique_ptr<RemoteEndpoint> _endpoint;
   std::size_t _nbytes;
   std::string _source;  // Reported to the monitors, see `Observation::source`.
+  // Object size and ETag that every direct receive range of this handle must match.
+  std::shared_ptr<detail::DirectReceiveObjectSnapshot> _direct_receive_snapshot;
 
  public:
   /**

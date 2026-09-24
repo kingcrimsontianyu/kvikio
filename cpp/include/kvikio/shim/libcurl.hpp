@@ -81,6 +81,8 @@ class CurlHandle {
  private:
   char _errbuf[CURL_ERROR_SIZE];
   LibCurl::UniqueHandlePtr _handle;
+  // Request headers set through `append_http_header()`. libcurl does not copy the list.
+  curl_slist* _http_headers{};
 
  public:
   /**
@@ -127,6 +129,19 @@ class CurlHandle {
    * @brief Discard the recorded error message.
    */
   void clear_error_message() noexcept;
+
+  /**
+   * @brief Append one HTTP request header and keep its storage alive for this handle.
+   *
+   * libcurl does not copy `CURLOPT_HTTPHEADER` lists, and each call to that option replaces the
+   * previous list. Owning the complete list here lets independent pieces, such as endpoint
+   * authentication and a conditional request, add headers to the same request.
+   *
+   * @param header The header line without a line terminator, for example `If-Match: "etag"`.
+   * @exception std::invalid_argument if the header is empty or contains a line break.
+   * @exception std::bad_alloc if libcurl cannot allocate the list node.
+   */
+  void append_http_header(std::string const& header);
 
   /**
    * @brief Set option for the curl handle.

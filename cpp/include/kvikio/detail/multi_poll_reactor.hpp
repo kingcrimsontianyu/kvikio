@@ -21,6 +21,7 @@
 
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/detail/concurrent_request_limiter.hpp>
+#include <kvikio/detail/direct_receive.hpp>
 #include <kvikio/detail/http_retry.hpp>
 #include <kvikio/detail/io_event_barrier.hpp>
 #include <kvikio/detail/observation_recorder.hpp>
@@ -158,6 +159,11 @@ class CurlMultiAttachment {
 struct RemoteMultiTransfer {
   std::unique_ptr<CurlHandle> curl;
 
+  // Direct receive state of a host-destination transfer, null on the ordinary path. libcurl holds
+  // pointers into it, so it is declared before `attachment` and destroyed after the easy handle has
+  // been detached.
+  std::unique_ptr<DirectReceiveTransfer> direct_receive;
+
   // Detaches `curl`'s easy handle from the multi handle on destruction.
   CurlMultiAttachment attachment;
 
@@ -202,6 +208,24 @@ struct RemoteMultiTransfer {
    **/
   ~RemoteMultiTransfer();
 };
+
+/**
+ * @brief Make a host-destination transfer use direct receive.
+ *
+ * Creates the transfer's libcurl callback state and configures its easy handle to receive into
+ * buffers lent by the reactor. `transfer.curl`, `transfer.ctx`, and `transfer.file_offset` must
+ * already be set.
+ *
+ * @param transfer The transfer to configure.
+ * @param object_snapshot The object-version snapshot shared by the remote handle's direct reads.
+ * @param strict_attempt Whether to request strict RX kTLS. False uses the copied stream.
+ * @param fallback_allowed Whether a strict attempt may fall back to the copied stream.
+ * @exception std::logic_error if this build's libcurl does not support direct receive.
+ */
+void configure_direct_receive_transfer(RemoteMultiTransfer& transfer,
+                                       std::shared_ptr<DirectReceiveObjectSnapshot> object_snapshot,
+                                       bool strict_attempt,
+                                       bool fallback_allowed);
 
 /**
  * @brief One reactor has one `CURLM*`, one I/O thread, one submit queue, one in-flight map.
@@ -284,6 +308,10 @@ class MultiPollReactor {
     // unelapsed retry backoff. The two take different poll timeouts.
     bool deferred_for_resource{false};
 
+    // Whether a direct receive transfer was lent a new buffer and resumed. Its data may already be
+    // waiting, so the next poll must not sleep.
+    bool direct_receive_progress{false};
+
     /**
      * @brief Record a backoff deadline, keeping the earliest.
      *
@@ -360,6 +388,64 @@ class MultiPollReactor {
   void settle_transfer(std::unique_ptr<RemoteMultiTransfer> transfer,
                        CURLcode result,
                        PassOutcome& outcome);
+
+  /**
+   * @brief Settle one finished direct receive transfer: complete it, fall back to the copied
+   * stream, requeue it for retry, or fail it.
+   *
+   * @param transfer The transfer, already detached from `_in_flight`.
+   * @param result libcurl's result code for the attempt.
+   * @param outcome Updated with the backoff deadline if the transfer is requeued for retry.
+   */
+  void settle_direct_receive_transfer(std::unique_ptr<RemoteMultiTransfer> transfer,
+                                      CURLcode result,
+                                      PassOutcome& outcome);
+
+  /**
+   * @brief Lend a direct receive transfer its next buffer.
+   *
+   * Before the final response headers are validated, the buffer is the transfer's small header
+   * window. Afterwards it is the unfilled rest of the destination, so the body lands in place.
+   *
+   * @param transfer An in-flight or admitting direct receive transfer that needs a buffer.
+   * @param resume Whether to resume the transfer, which libcurl paused when it found no buffer.
+   * @exception std::runtime_error if `curl_easy_pause()` fails.
+   */
+  void lend_direct_receive_buffer(RemoteMultiTransfer& transfer, bool resume);
+
+  /**
+   * @brief Publish the body bytes of a released direct receive buffer into the destination.
+   *
+   * Bytes received into the destination are validated in place. Bytes that shared the header
+   * window with the response headers are copied to their final offset. Does nothing if no buffer
+   * has been released.
+   *
+   * @param transfer A direct receive transfer.
+   * @exception std::logic_error if the released buffer's description is inconsistent.
+   */
+  void place_direct_receive_buffer(RemoteMultiTransfer& transfer);
+
+  /**
+   * @brief After `curl_multi_perform()` and `reap_completions()`, place every released buffer and
+   * lend the next one.
+   *
+   * Must follow `reap_completions()`, because a finished transfer cannot be resumed. A transfer
+   * whose buffers cannot be handled is detached and failed on its own.
+   *
+   * @return Whether any transfer was lent a buffer and resumed, or was failed.
+   */
+  bool advance_direct_receive_transfers();
+
+  /**
+   * @brief Reconfigure a finished direct receive transfer and requeue it in `_pending`.
+   *
+   * @param transfer The transfer, already detached from `_in_flight`.
+   * @param strict_attempt Whether the next attempt requests strict RX kTLS.
+   * @param ready_at Earliest time the transfer may be admitted again.
+   */
+  void requeue_direct_receive(std::unique_ptr<RemoteMultiTransfer> transfer,
+                              bool strict_attempt,
+                              std::chrono::steady_clock::time_point ready_at) noexcept;
 
   /**
    * @brief Queue the pinned-to-device copy of a finished device transfer and arrange for its bounce

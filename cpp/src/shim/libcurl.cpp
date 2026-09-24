@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -19,6 +20,7 @@
 
 #include <kvikio/defaults.hpp>
 #include <kvikio/detail/curl_share.hpp>
+#include <kvikio/detail/direct_receive.hpp>
 #include <kvikio/detail/http_retry.hpp>
 #include <kvikio/detail/parallel_operation.hpp>
 #include <kvikio/detail/posix_io.hpp>
@@ -30,10 +32,24 @@
 #include <kvikio/statistics/counters.hpp>
 #include <kvikio/utils.hpp>
 
+#if defined(KVIKIO_HAS_CURL_DIRECT_RECEIVE)
+// Exported by a libcurl that implements caller-owned receive buffers. libcurl declares it only in an
+// internal header.
+extern "C" unsigned int curl_recv_buffer_build_version_v1(void);
+#endif
+
 namespace kvikio {
 
 LibCurl::LibCurl()
 {
+#if defined(KVIKIO_HAS_CURL_DIRECT_RECEIVE)
+  // The receive-buffer options are ordinary `curl_easy_setopt` numbers, so headers from a patched
+  // libcurl would compile and link against a stock library. Requiring the marker symbol makes such a
+  // mismatch fail at link or load time instead.
+  KVIKIO_EXPECT(curl_recv_buffer_build_version_v1() == 1U,
+                "cannot initialize libcurl - incompatible caller-owned receive-buffer ABI",
+                std::runtime_error);
+#endif
   CURLcode err = curl_global_init(CURL_GLOBAL_DEFAULT);
   KVIKIO_EXPECT(err == CURLE_OK,
                 "cannot initialize libcurl - errorcode: " + std::to_string(err),
@@ -131,7 +147,11 @@ CurlHandle::CurlHandle(LibCurl::UniqueHandlePtr handle,
 CurlHandle::~CurlHandle() noexcept
 {
   std::ignore = curl_easy_setopt(_handle.get(), CURLOPT_SHARE, static_cast<CURLSH*>(nullptr));
+  // Detach the header list before freeing it. The pooled handle is reset only when it is reused.
+  std::ignore =
+    curl_easy_setopt(_handle.get(), CURLOPT_HTTPHEADER, static_cast<curl_slist*>(nullptr));
   LibCurl::instance().retain_handle(std::move(_handle));
+  curl_slist_free_all(_http_headers);
 }
 
 CURL* CurlHandle::handle() noexcept { return _handle.get(); }
@@ -177,6 +197,17 @@ void count_http_connection_of(CURL* easy) noexcept
 }  // namespace detail
 
 void CurlHandle::clear_error_message() noexcept { _errbuf[0] = 0; }
+
+void CurlHandle::append_http_header(std::string const& header)
+{
+  KVIKIO_EXPECT(!header.empty() && header.find_first_of("\r\n") == std::string::npos,
+                "HTTP header must be nonempty and contain no line break",
+                std::invalid_argument);
+  auto* const appended = curl_slist_append(_http_headers, header.c_str());
+  if (appended == nullptr) { throw std::bad_alloc{}; }
+  _http_headers = appended;
+  setopt(CURLOPT_HTTPHEADER, _http_headers);
+}
 
 void CurlHandle::perform() { perform({}); }
 

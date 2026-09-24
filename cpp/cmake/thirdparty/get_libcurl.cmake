@@ -14,12 +14,15 @@ function(find_and_configure_libcurl)
     set(CACHE_HAS_BUILD_TESTING $CACHE{BUILD_TESTING})
   endif()
 
+  # Remote direct receive needs libcurl's caller-owned receive buffers and strict RX kTLS, which are
+  # experimental extensions not yet in upstream curl. The fetched fallback is a curl 8.22.0-dev fork
+  # that provides them. KvikIO still builds against any other libcurl, without direct receive.
   rapids_cpm_find(
-    CURL 8.13.0
+    CURL 8.22.0
     GLOBAL_TARGETS libcurl
     CPM_ARGS
-    GIT_REPOSITORY https://github.com/curl/curl
-    GIT_TAG curl-8_13_0
+    GIT_REPOSITORY https://github.com/kjmph/curl.git
+    GIT_TAG 1c7a9684406103c9ab226ad7671f46322799653f
     OPTIONS "BUILD_CURL_EXE OFF" "BUILD_SHARED_LIBS OFF" "BUILD_TESTING OFF" "CURL_USE_LIBPSL OFF"
             "CURL_DISABLE_LDAP ON" "CMAKE_POSITION_INDEPENDENT_CODE ON"
     EXCLUDE_FROM_ALL YES # Don't install libcurl.a (only needed when building libkvikio.so)

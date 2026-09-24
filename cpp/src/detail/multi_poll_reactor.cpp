@@ -21,6 +21,8 @@
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
 #include <kvikio/detail/bounce_buffer_cache.hpp>
+#include <kvikio/detail/direct_receive.hpp>
+#include <kvikio/detail/direct_receive_stats.hpp>
 #include <kvikio/detail/multi_poll_reactor.hpp>
 #include <kvikio/detail/stream.hpp>
 #include <kvikio/error.hpp>
@@ -299,6 +301,20 @@ bool MultiPollReactor::try_admit(std::unique_ptr<RemoteMultiTransfer>& transfer,
     transfer->ctx.pinned_buffer = transfer->buffer.get();
   }
 
+  // A direct receive transfer starts with its header window lent to libcurl. A snapshot ETag learned
+  // by an earlier range is sent as If-Match, so this range must come from the same object version.
+  if (transfer->direct_receive) {
+    lend_direct_receive_buffer(*transfer, false);
+    auto& direct_receive = *transfer->direct_receive;
+    if (!direct_receive.if_match_applied) {
+      auto const entity_tag = direct_receive.object_snapshot->if_match_entity_tag();
+      if (entity_tag.has_value()) {
+        transfer->curl->append_http_header("If-Match: " + entity_tag.value());
+        direct_receive.if_match_applied = true;
+      }
+    }
+  }
+
   // Hand the easy handle to libcurl. A failure here is fatal for the pool. The transfer stays where
   // it is. `fail_all_pending()` then resolves it, along with everything else, with this exception.
   auto* easy    = transfer->curl->handle();
@@ -401,6 +417,308 @@ void MultiPollReactor::stage_device_copy(RemoteMultiTransfer& transfer)
     });
 }
 
+void configure_direct_receive_transfer(RemoteMultiTransfer& transfer,
+                                       std::shared_ptr<DirectReceiveObjectSnapshot> object_snapshot,
+                                       bool strict_attempt,
+                                       bool fallback_allowed)
+{
+#if defined(KVIKIO_HAS_CURL_DIRECT_RECEIVE)
+  auto direct_receive              = std::make_unique<DirectReceiveTransfer>();
+  direct_receive->object_snapshot  = std::move(object_snapshot);
+  direct_receive->strict_attempt   = strict_attempt;
+  direct_receive->fallback_allowed = fallback_allowed;
+  direct_receive->callbacks        = std::make_unique<CurlDirectReceiveState>(
+    transfer.file_offset, transfer.ctx.size, direct_receive->object_snapshot);
+  direct_receive->callbacks->configure(*transfer.curl, strict_attempt);
+  transfer.direct_receive = std::move(direct_receive);
+#else
+  std::ignore = transfer;
+  std::ignore = object_snapshot;
+  std::ignore = strict_attempt;
+  std::ignore = fallback_allowed;
+  KVIKIO_FAIL("remote direct receive is not supported by this libcurl build", std::logic_error);
+#endif
+}
+
+#if defined(KVIKIO_HAS_CURL_DIRECT_RECEIVE)
+
+void MultiPollReactor::lend_direct_receive_buffer(RemoteMultiTransfer& transfer, bool resume)
+{
+  auto& direct_receive = *transfer.direct_receive;
+  auto& callbacks      = *direct_receive.callbacks;
+  auto const placed    = callbacks.body_bytes();
+  KVIKIO_EXPECT(placed < transfer.ctx.size,
+                "direct receive asked for a buffer after its body completed",
+                std::logic_error);
+
+  if (callbacks.response_body_accepted()) {
+    // The final response headers are validated. Lend the unfilled rest of the destination, which
+    // keeps receiving until the range is complete.
+    callbacks.install_buffer(transfer.ctx.buf + placed, transfer.ctx.size - placed, false);
+    direct_receive.buffer_is_destination = true;
+  } else {
+    // Headers may still arrive. They must not land in the caller's buffer.
+    if (direct_receive.header_window.empty()) {
+      direct_receive.header_window.resize(direct_receive_minimum_receive_size());
+    }
+    callbacks.install_buffer(direct_receive.header_window.data(),
+                             direct_receive.header_window.size());
+    direct_receive.buffer_is_destination = false;
+  }
+  direct_receive.buffer_body_offset = placed;
+
+  if (resume) {
+    auto const result = curl_easy_pause(transfer.curl->handle(), CURLPAUSE_CONT);
+    KVIKIO_EXPECT(result == CURLE_OK,
+                  std::string{"curl_easy_pause(CURLPAUSE_CONT): "} + curl_easy_strerror(result),
+                  std::runtime_error);
+  }
+}
+
+void MultiPollReactor::place_direct_receive_buffer(RemoteMultiTransfer& transfer)
+{
+  auto& direct_receive = *transfer.direct_receive;
+  auto& callbacks      = *direct_receive.callbacks;
+  if (!callbacks.buffer_ready()) { return; }
+
+  auto const released = callbacks.take_released_buffer();
+  auto const body_end = callbacks.body_bytes();
+  KVIKIO_EXPECT(released.body_bytes <= body_end,
+                "direct receive body accounting underflow",
+                std::logic_error);
+  auto const body_begin = body_end - released.body_bytes;
+
+  void const* source{nullptr};
+  std::size_t source_capacity{0};
+  if (direct_receive.buffer_is_destination) {
+    source          = transfer.ctx.buf + direct_receive.buffer_body_offset;
+    source_capacity = transfer.ctx.size - direct_receive.buffer_body_offset;
+  } else {
+    source          = direct_receive.header_window.data();
+    source_capacity = direct_receive.header_window.size();
+  }
+  auto const placement = place_direct_receive_on_host(source,
+                                                      source_capacity,
+                                                      released,
+                                                      transfer.ctx.buf,
+                                                      transfer.ctx.size,
+                                                      body_begin,
+                                                      direct_receive.buffer_is_destination);
+  direct_receive.direct_bytes += placement.direct_bytes;
+  direct_receive.staged_bytes += placement.staged_bytes;
+  direct_receive.buffer_is_destination = false;
+  direct_receive.buffer_body_offset    = 0;
+}
+
+bool MultiPollReactor::advance_direct_receive_transfers()
+{
+  bool progress = false;
+  // Transfers whose buffers could not be handled. Empty, and so free of allocation, in practice.
+  std::vector<std::pair<CURL*, std::exception_ptr>> failed;
+  for (auto& [easy, transfer] : _in_flight) {
+    if (!transfer->direct_receive) { continue; }
+    auto& direct_receive = *transfer->direct_receive;
+    auto& callbacks      = *direct_receive.callbacks;
+    try {
+      // Each pass places a released buffer or lends a new one. Both consume received bytes, so the
+      // loop ends.
+      while (!callbacks.callback_failed()) {
+        // Once the final 206 headers are accepted, release the header window at once instead of
+        // filling it with payload. The next buffer is then the destination itself.
+        if (!direct_receive.buffer_is_destination && !callbacks.buffer_ready() &&
+            !callbacks.needs_buffer() && callbacks.response_body_accepted()) {
+          callbacks.finalize_current_buffer();
+        }
+        place_direct_receive_buffer(*transfer);
+        if (!callbacks.needs_buffer()) { break; }
+        lend_direct_receive_buffer(*transfer, true);
+        progress = true;
+      }
+    } catch (...) {
+      failed.emplace_back(easy, std::current_exception());
+    }
+  }
+
+  for (auto& [easy, error] : failed) {
+    auto it       = _in_flight.find(easy);
+    auto transfer = std::move(it->second);
+    _in_flight.erase(it);
+    // Detach before resolving the aggregate. Once it resolves, the caller may free the destination.
+    transfer->attachment.reset();
+    transfer->physical_recorder.reset();
+    direct_receive_record_failed(DirectReceiveFailureReason::other);
+    transfer->aggregate->on_subrange_failed(error);
+    progress = true;
+  }
+  return progress;
+}
+
+void MultiPollReactor::settle_direct_receive_transfer(std::unique_ptr<RemoteMultiTransfer> transfer,
+                                                      CURLcode result,
+                                                      PassOutcome& outcome)
+{
+  auto& direct_receive  = *transfer->direct_receive;
+  auto& callbacks       = *direct_receive.callbacks;
+  bool protocol_failure = false;
+  std::exception_ptr error;
+  try {
+    // Publish whatever the last lent buffer holds.
+    callbacks.finalize_current_buffer();
+    place_direct_receive_buffer(*transfer);
+
+    long direct_status = CURL_KTLS_DIRECT_RX_NONE;
+    transfer->curl->getinfo(CURLINFO_KTLS_DIRECT_RX_STATUS, &direct_status);
+    if (direct_receive.strict_attempt && direct_status == CURL_KTLS_DIRECT_RX_ACTIVE &&
+        !direct_receive.strict_activation_recorded) {
+      direct_receive.strict_activation_recorded = true;
+      direct_receive_record_strict_activated();
+    }
+
+    if (callbacks.callback_failed()) {
+      // A callback failure is a local ownership or response-validation violation, not a transient
+      // transport error. Retrying it would repeat a deterministic failure and hide its cause.
+      protocol_failure = callbacks.callback_protocol_validation_failed();
+      error = std::make_exception_ptr(std::runtime_error(std::string{callbacks.callback_error()}));
+    } else if (result == CURLE_OK) {
+      auto validation_error = callbacks.validate(*transfer->curl);
+      if (!validation_error.has_value() && direct_receive.strict_attempt &&
+          direct_status != CURL_KTLS_DIRECT_RX_ACTIVE) {
+        validation_error = "strict direct receive completed without activating RX kTLS";
+      }
+      if (validation_error.has_value()) {
+        protocol_failure = true;
+        error = std::make_exception_ptr(std::runtime_error(validation_error.value()));
+      } else {
+        if (direct_receive.strict_attempt) {
+          direct_receive_record_strict_completion(callbacks.raw_bytes(), callbacks.body_bytes());
+        } else {
+          direct_receive_record_copied_completion(callbacks.raw_bytes(), callbacks.body_bytes());
+        }
+        direct_receive_record_placement(direct_receive.direct_bytes, direct_receive.staged_bytes);
+        // Before the aggregate, which may make the caller's future ready.
+        transfer->physical_recorder->finish(transfer->ctx.size);
+        transfer->aggregate->on_subrange_complete(transfer->ctx.size);
+        return;
+      }
+    } else if (direct_receive.strict_attempt && direct_receive.fallback_allowed &&
+               direct_receive_can_fallback(
+                 false, result, direct_status, callbacks.body_bytes())) {
+      // Strict RX kTLS was unavailable before any body byte arrived. Retry at once through the
+      // copied stream.
+      direct_receive_record_fallback(DirectReceiveFallbackReason::capability_unavailable);
+      transfer->physical_recorder.reset();
+      requeue_direct_receive(std::move(transfer), false, std::chrono::steady_clock::now());
+      return;
+    } else {
+      long http_code = 0;
+      transfer->curl->getinfo(CURLINFO_RESPONSE_CODE, &http_code);
+      if (direct_receive.object_snapshot->requires_entity_tag() && http_code == 412) {
+        // A failed object-version precondition means the object changed. Retrying cannot help.
+        protocol_failure = true;
+        if (direct_receive.if_match_applied) {
+          error = std::make_exception_ptr(std::runtime_error(
+            "remote direct receive: the object changed after its ETag snapshot was taken"));
+        } else {
+          error = std::make_exception_ptr(
+            std::runtime_error("remote direct receive: the S3 request failed a precondition"));
+        }
+      } else {
+        ++transfer->attempt;
+        auto const errmsg  = transfer->curl->error_message();
+        auto const verdict = transfer->retry_policy->evaluate(
+          result, http_code, transfer->attempt, errmsg, "curl_multi transfer failed");
+        if (verdict.decision == RetryDecision::RETRY) {
+          KVIKIO_LOG_WARN(verdict.message);
+          count_http_retry(verdict.delay_ms);
+          direct_receive_record_retry();
+          auto const ready_at = std::chrono::steady_clock::now() + verdict.delay_ms;
+          outcome.record_ready_at(ready_at);
+          transfer->physical_recorder.reset();
+          bool const strict_attempt = direct_receive.strict_attempt;
+          requeue_direct_receive(std::move(transfer), strict_attempt, ready_at);
+          return;
+        }
+        error = std::make_exception_ptr(std::runtime_error(verdict.message));
+      }
+    }
+  } catch (...) {
+    error = std::current_exception();
+  }
+  if (protocol_failure) {
+    direct_receive_record_failed(DirectReceiveFailureReason::protocol_validation);
+  } else {
+    direct_receive_record_failed(DirectReceiveFailureReason::other);
+  }
+  transfer->physical_recorder.reset();
+  transfer->aggregate->on_subrange_failed(error);
+}
+
+void MultiPollReactor::requeue_direct_receive(std::unique_ptr<RemoteMultiTransfer> transfer,
+                                              bool strict_attempt,
+                                              std::chrono::steady_clock::time_point ready_at) noexcept
+{
+  try {
+    // Detach the finished easy handle before reconfiguring it.
+    transfer->attachment.reset();
+    transfer->slot.reset();
+
+    auto& direct_receive = *transfer->direct_receive;
+    auto callbacks       = std::make_unique<CurlDirectReceiveState>(
+      transfer->file_offset, transfer->ctx.size, direct_receive.object_snapshot);
+    callbacks->configure(*transfer->curl, strict_attempt);
+    // A failed direct attempt, possibly with a partial body, must not reuse its connection.
+    transfer->curl->setopt(CURLOPT_FRESH_CONNECT, 1L);
+    direct_receive.callbacks             = std::move(callbacks);
+    direct_receive.strict_attempt        = strict_attempt;
+    direct_receive.buffer_is_destination = false;
+    direct_receive.buffer_body_offset    = 0;
+    direct_receive.direct_bytes          = 0;
+    direct_receive.staged_bytes          = 0;
+    // Do not hold the header window through a backoff. Admission allocates it again.
+    direct_receive.header_window.clear();
+    direct_receive.header_window.shrink_to_fit();
+  } catch (...) {
+    direct_receive_record_failed(DirectReceiveFailureReason::other);
+    transfer->aggregate->on_subrange_failed(std::current_exception());
+    return;
+  }
+  requeue_for_retry(std::move(transfer), ready_at);
+}
+
+#else
+
+// Without libcurl support no transfer owns direct receive state, so none of these is reached.
+
+void MultiPollReactor::lend_direct_receive_buffer(RemoteMultiTransfer&, bool)
+{
+  KVIKIO_FAIL("remote direct receive is not supported by this libcurl build", std::logic_error);
+}
+
+void MultiPollReactor::place_direct_receive_buffer(RemoteMultiTransfer&)
+{
+  KVIKIO_FAIL("remote direct receive is not supported by this libcurl build", std::logic_error);
+}
+
+bool MultiPollReactor::advance_direct_receive_transfers() { return false; }
+
+void MultiPollReactor::settle_direct_receive_transfer(std::unique_ptr<RemoteMultiTransfer> transfer,
+                                                      CURLcode,
+                                                      PassOutcome&)
+{
+  transfer->aggregate->on_subrange_failed(std::make_exception_ptr(
+    std::logic_error("remote direct receive is not supported by this libcurl build")));
+}
+
+void MultiPollReactor::requeue_direct_receive(std::unique_ptr<RemoteMultiTransfer> transfer,
+                                              bool,
+                                              std::chrono::steady_clock::time_point) noexcept
+{
+  transfer->aggregate->on_subrange_failed(std::make_exception_ptr(
+    std::logic_error("remote direct receive is not supported by this libcurl build")));
+}
+
+#endif
+
 void MultiPollReactor::settle_transfer(std::unique_ptr<RemoteMultiTransfer> transfer,
                                        CURLcode result,
                                        PassOutcome& outcome)
@@ -464,7 +782,11 @@ std::size_t MultiPollReactor::reap_completions(PassOutcome& outcome)
     auto transfer = std::move(it->second);
     _in_flight.erase(it);
     count_http_connection_of(easy);
-    settle_transfer(std::move(transfer), msg->data.result, outcome);
+    if (transfer->direct_receive) {
+      settle_direct_receive_transfer(std::move(transfer), msg->data.result, outcome);
+    } else {
+      settle_transfer(std::move(transfer), msg->data.result, outcome);
+    }
   }
   return completed;
 }
@@ -477,6 +799,9 @@ int MultiPollReactor::poll_timeout_ms(PassOutcome const& outcome,
   // Backstop while work waits on a slot or a bounce buffer. Both normally wake the poll on release,
   // by a completion or by the recycle callback.
   constexpr int busy_timeout_ms = 10;
+
+  // A resumed direct receive transfer may have data waiting already. Drive it before sleeping.
+  if (outcome.direct_receive_progress) { return 0; }
 
   // Under SHARED_QUEUE an empty `_pending` is not idle while the pool-wide queue holds work.
   bool const pool_work_waiting = _pool->uses_shared_queue() && _pool->queued_count_hint() > 0;
@@ -523,6 +848,9 @@ void MultiPollReactor::io_thread_main()
       auto outcome = admit_pending();
       perform();
       auto const completed = reap_completions(outcome);
+      // After reaping, so only transfers that are still receiving are resumed. A finished transfer
+      // has no connection, and resuming it is an error.
+      if (advance_direct_receive_transfers()) { outcome.direct_receive_progress = true; }
       poll(poll_timeout_ms(outcome, completed));
     }
   } catch (...) {

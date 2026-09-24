@@ -90,6 +90,33 @@ def infer_remote_endpoint_type(url: str) -> RemoteEndpointType:
     return RemoteEndpointType[result.name]
 
 
+def remote_direct_receive_supported() -> bool:
+    """Whether this KvikIO build can use remote direct receive.
+
+    Direct receive needs a libcurl that provides caller-owned receive buffers and
+    strict RX kTLS. See ``KVIKIO_REMOTE_DIRECT_RECEIVE``.
+    """
+    return _get_remote_module().remote_direct_receive_supported()
+
+
+def remote_direct_receive_stats() -> dict[str, int]:
+    """Cumulative counters of the experimental remote direct receive path.
+
+    The counters tell strict RX kTLS transfers apart from copied-stream transfers,
+    and bytes received at their final offset apart from bytes copied out of the
+    header window. Take a snapshot before and after a benchmark and compare them.
+    """
+    return _get_remote_module().remote_direct_receive_stats()
+
+
+def reset_remote_direct_receive_stats() -> None:
+    """Reset the remote direct receive counters to zero.
+
+    Call only while no remote reads are in flight.
+    """
+    _get_remote_module().reset_remote_direct_receive_stats()
+
+
 class RemoteFile:
     """File handle of a remote file."""
 

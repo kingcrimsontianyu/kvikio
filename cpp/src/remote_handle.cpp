@@ -18,6 +18,8 @@
 
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
+#include <kvikio/detail/direct_receive.hpp>
+#include <kvikio/detail/direct_receive_stats.hpp>
 #include <kvikio/detail/env.hpp>
 #include <kvikio/detail/http_retry.hpp>
 #include <kvikio/detail/io_event_barrier.hpp>
@@ -30,6 +32,7 @@
 #include <kvikio/detail/url.hpp>
 #include <kvikio/error.hpp>
 #include <kvikio/hdfs.hpp>
+#include <kvikio/remote_direct_receive.hpp>
 #include <kvikio/remote_handle.hpp>
 #include <kvikio/shim/libcurl.hpp>
 #include <kvikio/statistics/counters.hpp>
@@ -198,6 +201,37 @@ void setup_range_request_impl(CurlHandle& curl, std::size_t file_offset, std::si
   curl.setopt(CURLOPT_RANGE, byte_range.c_str());
 }
 
+/**
+ * @brief Whether a URL's scheme is HTTPS.
+ *
+ * @param url The URL passed to libcurl.
+ * @return `true` for an `https` URL, `false` otherwise or if the URL cannot be parsed.
+ */
+bool url_uses_origin_tls(std::string const& url) noexcept
+{
+  try {
+    auto const scheme =
+      detail::UrlParser::extract_component(url, CURLUPART_SCHEME, CURLU_NON_SUPPORT_SCHEME);
+    return scheme.has_value() && scheme.value() == "https";
+  } catch (...) {
+    return false;
+  }
+}
+
+/**
+ * @brief Create the object-version snapshot shared by all direct receive reads of one handle.
+ *
+ * @param endpoint The handle's endpoint.
+ * @param nbytes The object size recorded when the handle was opened.
+ * @return The snapshot.
+ */
+std::shared_ptr<detail::DirectReceiveObjectSnapshot> make_direct_receive_snapshot(
+  RemoteEndpoint const& endpoint, std::size_t nbytes)
+{
+  return std::make_shared<detail::DirectReceiveObjectSnapshot>(
+    nbytes, endpoint.direct_receive_requires_entity_tag(), endpoint.direct_receive_sends_if_match());
+}
+
 bool is_read_out_of_bounds(std::size_t file_offset, std::size_t size, std::size_t nbytes) noexcept
 {
   return file_offset > nbytes || size > nbytes - file_offset;
@@ -364,6 +398,10 @@ void HttpEndpoint::setup_range_request(CurlHandle& curl, std::size_t file_offset
   setup_range_request_impl(curl, file_offset, size);
 }
 
+bool HttpEndpoint::supports_exact_http_range() const noexcept { return true; }
+
+bool HttpEndpoint::uses_origin_tls() const noexcept { return url_uses_origin_tls(_url); }
+
 bool HttpEndpoint::is_url_valid(std::string const& url) noexcept
 {
   try {
@@ -386,7 +424,7 @@ void S3Endpoint::setopt(CurlHandle& curl)
 
   curl.setopt(CURLOPT_AWS_SIGV4, _aws_sigv4.c_str());
   curl.setopt(CURLOPT_USERPWD, _aws_userpwd.c_str());
-  if (_curl_header_list) { curl.setopt(CURLOPT_HTTPHEADER, _curl_header_list); }
+  if (_session_token_header.has_value()) { curl.append_http_header(_session_token_header.value()); }
 }
 
 std::string S3Endpoint::url_from_bucket_and_object(std::string bucket_name,
@@ -469,19 +507,12 @@ S3Endpoint::S3Endpoint(std::string url,
   // Access key IDs beginning with ASIA are temporary credentials that are created using AWS STS
   // operations. They need a session token to work.
   if (access_key->compare(0, 4, std::string("ASIA")) == 0) {
-    // Create a Custom Curl header for the session token.
-    // The _curl_header_list created by curl_slist_append must be manually freed
-    // (see https://curl.se/libcurl/c/CURLOPT_HTTPHEADER.html)
+    // Each request's `CurlHandle` owns its header list, so keep only the header line here.
     auto session_token =
       detail::unwrap_or_env(std::move(aws_session_token),
                             "AWS_SESSION_TOKEN",
                             "When using temporary credentials, AWS_SESSION_TOKEN must be set.");
-    std::stringstream ss;
-    ss << "x-amz-security-token: " << session_token.value();
-    _curl_header_list = curl_slist_append(NULL, ss.str().c_str());
-    KVIKIO_EXPECT(_curl_header_list != nullptr,
-                  "Failed to create curl header for AWS token",
-                  std::runtime_error);
+    _session_token_header = "x-amz-security-token: " + session_token.value();
   }
 }
 
@@ -503,7 +534,7 @@ S3Endpoint::S3Endpoint(std::pair<std::string, std::string> bucket_and_object_nam
   KVIKIO_NVTX_FUNC_RANGE();
 }
 
-S3Endpoint::~S3Endpoint() { curl_slist_free_all(_curl_header_list); }
+S3Endpoint::~S3Endpoint() = default;
 
 std::string S3Endpoint::str() const { return _url; }
 
@@ -518,6 +549,14 @@ void S3Endpoint::setup_range_request(CurlHandle& curl, std::size_t file_offset, 
   KVIKIO_NVTX_FUNC_RANGE();
   setup_range_request_impl(curl, file_offset, size);
 }
+
+bool S3Endpoint::supports_exact_http_range() const noexcept { return true; }
+
+bool S3Endpoint::uses_origin_tls() const noexcept { return url_uses_origin_tls(_url); }
+
+bool S3Endpoint::direct_receive_requires_entity_tag() const noexcept { return true; }
+
+bool S3Endpoint::direct_receive_sends_if_match() const noexcept { return true; }
 
 bool S3Endpoint::is_url_valid(std::string const& url) noexcept
 {
@@ -565,6 +604,14 @@ void S3PublicEndpoint::setup_range_request(CurlHandle& curl,
   KVIKIO_NVTX_FUNC_RANGE();
   setup_range_request_impl(curl, file_offset, size);
 }
+
+bool S3PublicEndpoint::supports_exact_http_range() const noexcept { return true; }
+
+bool S3PublicEndpoint::uses_origin_tls() const noexcept { return url_uses_origin_tls(_url); }
+
+bool S3PublicEndpoint::direct_receive_requires_entity_tag() const noexcept { return true; }
+
+bool S3PublicEndpoint::direct_receive_sends_if_match() const noexcept { return true; }
 
 bool S3PublicEndpoint::is_url_valid(std::string const& url) noexcept
 {
@@ -665,6 +712,18 @@ void S3EndpointWithPresignedUrl::setup_range_request(CurlHandle& curl,
   setup_range_request_impl(curl, file_offset, size);
 }
 
+bool S3EndpointWithPresignedUrl::supports_exact_http_range() const noexcept { return true; }
+
+bool S3EndpointWithPresignedUrl::uses_origin_tls() const noexcept
+{
+  return url_uses_origin_tls(_url);
+}
+
+bool S3EndpointWithPresignedUrl::direct_receive_requires_entity_tag() const noexcept
+{
+  return true;
+}
+
 bool S3EndpointWithPresignedUrl::is_url_valid(std::string const& url) noexcept
 {
   try {
@@ -733,14 +792,16 @@ RemoteHandle::RemoteHandle(std::unique_ptr<RemoteEndpoint> endpoint, std::size_t
   : _endpoint{std::move(endpoint)}, _nbytes{nbytes}, _source{_endpoint->str()}
 {
   KVIKIO_NVTX_FUNC_RANGE();
+  _direct_receive_snapshot = make_direct_receive_snapshot(*_endpoint, _nbytes);
 }
 
 RemoteHandle::RemoteHandle(std::unique_ptr<RemoteEndpoint> endpoint)
 {
   KVIKIO_NVTX_FUNC_RANGE();
-  _nbytes   = endpoint->get_file_size();
-  _endpoint = std::move(endpoint);
-  _source   = _endpoint->str();
+  _nbytes                  = endpoint->get_file_size();
+  _endpoint                = std::move(endpoint);
+  _source                  = _endpoint->str();
+  _direct_receive_snapshot = make_direct_receive_snapshot(*_endpoint, _nbytes);
 }
 
 RemoteEndpointType RemoteHandle::remote_endpoint_type() const noexcept
@@ -895,8 +956,46 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   expect_read_in_bounds(size, file_offset);
 
   detail::expect_not_in_monitor();
-  bool const is_host_mem = is_host_memory(buf);
-  auto const io_backend  = defaults::remote_io_backend();
+  bool const is_host_mem         = is_host_memory(buf);
+  auto const io_backend          = defaults::remote_io_backend();
+  auto const direct_receive_mode = defaults::remote_direct_receive_mode();
+
+  // Decide whether this read uses direct receive. `REQUIRE` rejects an ineligible read here, before
+  // any request exists, instead of silently using the ordinary path.
+  bool use_direct_receive{false};
+  bool direct_receive_strict_attempt{false};
+  bool record_ineligible_direct_receive{false};
+  if (direct_receive_mode != RemoteDirectReceiveMode::OFF) {
+    bool const eligible_backend     = io_backend == RemoteIOBackend::MULTI_POLL;
+    bool const eligible_build       = remote_direct_receive_supported();
+    bool const eligible_endpoint    = _endpoint->supports_exact_http_range();
+    bool const eligible_destination = is_host_mem;
+    if (direct_receive_mode == RemoteDirectReceiveMode::REQUIRE) {
+      KVIKIO_EXPECT(eligible_backend,
+                    "remote direct receive REQUIRE needs the MULTI_POLL backend",
+                    std::runtime_error);
+      KVIKIO_EXPECT(eligible_build,
+                    "remote direct receive REQUIRE needs a libcurl with caller-owned receive "
+                    "buffers and strict RX kTLS",
+                    std::runtime_error);
+      KVIKIO_EXPECT(eligible_endpoint,
+                    "remote direct receive REQUIRE needs an exact-range HTTP or S3 endpoint",
+                    std::runtime_error);
+      KVIKIO_EXPECT(eligible_destination,
+                    "remote direct receive REQUIRE currently supports host destinations only",
+                    std::runtime_error);
+    }
+    use_direct_receive =
+      eligible_backend && eligible_build && eligible_endpoint && eligible_destination;
+    record_ineligible_direct_receive = !use_direct_receive;
+  }
+  if (use_direct_receive) {
+    direct_receive_strict_attempt = _endpoint->uses_origin_tls();
+    KVIKIO_EXPECT(
+      direct_receive_mode != RemoteDirectReceiveMode::REQUIRE || direct_receive_strict_attempt,
+      "remote direct receive REQUIRE needs an HTTPS endpoint",
+      std::runtime_error);
+  }
 
   // Everything that can reject the call is checked before the recorder exists, so a call that never
   // reaches the I/O is not observed. The bounds check above does the same.
@@ -950,16 +1049,25 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
       physical_recorder.finish(bytes_read);
       return bytes_read;
     };
-    return detail::parallel_io(task,
-                               buf,
-                               size,
-                               file_offset,
-                               task_size,
-                               0,
-                               {.thread_pool = thread_pool,
-                                .call_idx    = call_idx,
-                                .nvtx_color  = nvtx_color,
-                                .recorder    = recorder});
+    auto result = detail::parallel_io(task,
+                                      buf,
+                                      size,
+                                      file_offset,
+                                      task_size,
+                                      0,
+                                      {.thread_pool = thread_pool,
+                                       .call_idx    = call_idx,
+                                       .nvtx_color  = nvtx_color,
+                                       .recorder    = recorder});
+    if (record_ineligible_direct_receive) {
+      std::size_t const num_tasks = 1 + (size - 1) / task_size;
+      for (std::size_t i = 0; i < num_tasks; ++i) {
+        detail::direct_receive_record_requested();
+        detail::direct_receive_record_fallback(
+          detail::DirectReceiveFallbackReason::ineligible_request);
+      }
+    }
+    return result;
   }
 
   // MULTI_POLL path. The lifecycle of one pread() call uses four cooperating pieces:
@@ -1010,16 +1118,26 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
     transfer->retry_policy = retry_policy;
     transfer->file_offset  = cur_off;
     transfer->physical     = physical;
-    if (is_host_mem) {
+    if (use_direct_receive) {
+      // The reactor lends libcurl a header window first and then the destination itself. The
+      // ordinary write callback and its copy are not used.
+      transfer->ctx.buf = cur_buf;
+      detail::configure_direct_receive_transfer(*transfer,
+                                                _direct_receive_snapshot,
+                                                direct_receive_strict_attempt,
+                                                direct_receive_mode ==
+                                                  RemoteDirectReceiveMode::PREFER);
+    } else if (is_host_mem) {
       transfer->ctx.buf = cur_buf;
       transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_host_memory);
+      transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
     } else {
       transfer->is_device  = true;
       transfer->device_ctx = io_event_barrier->cuda_context();
       transfer->device_dst = cur_buf;
       transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_pinned_buffer);
+      transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
     }
-    transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
     transfers.push_back(std::move(transfer));
     cur_buf += subrange_size;
     cur_off += subrange_size;
@@ -1028,6 +1146,17 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
 
   // One pool call per pread(). The pool consults the captured dispatch policy internally.
   detail::MultiReactorPool::instance().submit_pread(std::move(transfers));
+
+  if (use_direct_receive || record_ineligible_direct_receive) {
+    for (std::size_t i = 0; i < num_subranges; ++i) {
+      detail::direct_receive_record_requested();
+      // Cleartext HTTP uses the copied stream from the start, so it never tries strict receive.
+      if (!use_direct_receive || !direct_receive_strict_attempt) {
+        detail::direct_receive_record_fallback(
+          detail::DirectReceiveFallbackReason::ineligible_request);
+      }
+    }
+  }
 
   if (is_host_mem) { return fut; }
 

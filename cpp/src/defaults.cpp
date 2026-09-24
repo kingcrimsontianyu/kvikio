@@ -19,6 +19,7 @@
 #include <kvikio/detail/utils.hpp>
 #include <kvikio/error.hpp>
 #include <kvikio/http_status_codes.hpp>
+#include <kvikio/remote_direct_receive.hpp>
 #include <kvikio/remote_handle.hpp>
 #include <kvikio/shim/cufile.hpp>
 #include <kvikio/threadpool_wrapper.hpp>
@@ -87,6 +88,21 @@ RemoteReactorDispatch getenv_or(std::string_view env_var_name, RemoteReactorDisp
   if (normalized == "per_chunk") { return RemoteReactorDispatch::PER_CHUNK; }
   if (normalized == "per_pread") { return RemoteReactorDispatch::PER_PREAD; }
   if (normalized == "shared_queue") { return RemoteReactorDispatch::SHARED_QUEUE; }
+  KVIKIO_FAIL("unknown config value " + std::string{env_var_name} + "=" + std::string{env_val},
+              std::invalid_argument);
+}
+
+template <>
+RemoteDirectReceiveMode getenv_or(std::string_view env_var_name,
+                                  RemoteDirectReceiveMode default_val)
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+  auto const* env_val = std::getenv(env_var_name.data());
+  if (env_val == nullptr) { return default_val; }
+  auto const normalized = detail::normalize_env_value(env_val);
+  if (normalized == "off") { return RemoteDirectReceiveMode::OFF; }
+  if (normalized == "prefer") { return RemoteDirectReceiveMode::PREFER; }
+  if (normalized == "require") { return RemoteDirectReceiveMode::REQUIRE; }
   KVIKIO_FAIL("unknown config value " + std::string{env_var_name} + "=" + std::string{env_val},
               std::invalid_argument);
 }
@@ -185,6 +201,10 @@ defaults::defaults()
       "KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS has to be a non-negative integer (0 = unlimited)",
       std::invalid_argument);
     _remote_io_max_concurrent_requests = static_cast<std::size_t>(env);
+  }
+  {
+    _remote_direct_receive_mode =
+      getenv_or("KVIKIO_REMOTE_DIRECT_RECEIVE", RemoteDirectReceiveMode::OFF);
   }
 }
 
@@ -351,5 +371,15 @@ void defaults::set_remote_io_max_concurrent_requests(std::size_t max_requests)
                 std::runtime_error);
 #endif
   instance()->_remote_io_max_concurrent_requests = max_requests;
+}
+
+RemoteDirectReceiveMode defaults::remote_direct_receive_mode()
+{
+  return instance()->_remote_direct_receive_mode;
+}
+
+void defaults::set_remote_direct_receive_mode(RemoteDirectReceiveMode mode)
+{
+  instance()->_remote_direct_receive_mode = mode;
 }
 }  // namespace kvikio
