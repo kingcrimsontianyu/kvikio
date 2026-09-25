@@ -3,13 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -33,8 +36,8 @@
 #include <kvikio/utils.hpp>
 
 #if defined(KVIKIO_HAS_CURL_DIRECT_RECEIVE)
-// Exported by a libcurl that implements caller-owned receive buffers. libcurl declares it only in an
-// internal header.
+// Exported by a libcurl that implements caller-owned receive buffers. libcurl declares it only in
+// an internal header.
 extern "C" unsigned int curl_recv_buffer_build_version_v1(void);
 #endif
 
@@ -44,8 +47,8 @@ LibCurl::LibCurl()
 {
 #if defined(KVIKIO_HAS_CURL_DIRECT_RECEIVE)
   // The receive-buffer options are ordinary `curl_easy_setopt` numbers, so headers from a patched
-  // libcurl would compile and link against a stock library. Requiring the marker symbol makes such a
-  // mismatch fail at link or load time instead.
+  // libcurl would compile and link against a stock library. Requiring the marker symbol makes such
+  // a mismatch fail at link or load time instead.
   KVIKIO_EXPECT(curl_recv_buffer_build_version_v1() == 1U,
                 "cannot initialize libcurl - incompatible caller-owned receive-buffer ABI",
                 std::runtime_error);
@@ -140,6 +143,26 @@ CurlHandle::CurlHandle(LibCurl::UniqueHandlePtr handle,
   // Optionally enable verbose output if it's configured.
   auto const verbose = getenv_or("KVIKIO_REMOTE_VERBOSE", false);
   if (verbose) { setopt(CURLOPT_VERBOSE, 1L); }
+
+  // Size in bytes of libcurl's receive buffer, one per transfer. When unset, libcurl's own default
+  // of 16 KiB is used. The value must be positive, and is clamped to between 1 KiB and 10 MiB.
+  static std::optional<long> const buffer_size = []() -> std::optional<long> {
+    if (std::getenv("KVIKIO_REMOTE_IO_BUFFER_SIZE") == nullptr) { return std::nullopt; }
+    auto const requested = getenv_or("KVIKIO_REMOTE_IO_BUFFER_SIZE", ssize_t{0});
+    KVIKIO_EXPECT(
+      requested > 0, "KVIKIO_REMOTE_IO_BUFFER_SIZE must be positive", std::invalid_argument);
+    return static_cast<long>(std::clamp(requested, ssize_t{1024}, ssize_t{CURL_MAX_READ_SIZE}));
+  }();
+  if (buffer_size.has_value()) { setopt(CURLOPT_BUFFERSIZE, buffer_size.value()); }
+
+  // Bind every connection to one network interface, for hosts with several NICs on one subnet.
+  // The value is passed to libcurl verbatim: `<ip>` binds the source address, `if!<name>` binds
+  // the device, and `ifhost!<name>!<ip>` binds both.
+  static std::string const interface_opt = [] {
+    auto const* env = std::getenv("KVIKIO_REMOTE_IO_INTERFACE");
+    return std::string{env == nullptr ? "" : env};
+  }();
+  if (!interface_opt.empty()) { setopt(CURLOPT_INTERFACE, interface_opt.c_str()); }
 
   detail::set_up_ca_paths(*this);
 }
