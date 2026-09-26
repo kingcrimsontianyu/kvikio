@@ -15,9 +15,10 @@ namespace kvikio {
  *
  * With direct receive, libcurl reads a remote range into memory lent by KvikIO instead of its own
  * buffer. For host destinations, the response body lands at its final offset in the caller's
- * buffer, so KvikIO performs no copy after validating the response headers. Over HTTPS, strict
- * direct receive additionally lets the Linux kernel decrypt TLS records (RX kTLS) straight into that
- * memory.
+ * buffer, so KvikIO performs no copy after validating the response headers. For device
+ * destinations, it lands in the read's pinned bounce buffer, which is then copied to the device.
+ * Over HTTPS, strict direct receive additionally lets the Linux kernel decrypt TLS records (RX
+ * kTLS) straight into that memory.
  */
 enum class RemoteDirectReceiveMode : std::uint8_t {
   OFF     = 0,  ///< Use the ordinary remote receive path.

@@ -519,26 +519,86 @@ TEST(RemoteDirectReceive, require_rejects_an_ineligible_endpoint_before_any_requ
   EXPECT_EQ(endpoint_ptr->range_request_calls, 0);
 }
 
-TEST(RemoteDirectReceive, require_rejects_a_device_destination_before_any_request)
+TEST(RemoteDirectReceive, device_receive_places_multiple_nonzero_ranges)
 {
   if (!kvikio::remote_direct_receive_supported()) { GTEST_SKIP() << "no libcurl support"; }
   RestoreRemoteIoBackend const restore_backend;
   RestoreRemoteDirectReceiveMode const restore_mode;
   kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
-  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::REQUIRE);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
 
-  auto endpoint =
-    std::make_unique<CountingEndpoint>(kvikio::RemoteEndpointType::HTTP, "https://example.com/x");
-  auto* endpoint_ptr = endpoint.get();
-  kvikio::RemoteHandle remote_handle(std::move(endpoint), endpoint_ptr->file_size);
+  // Each range is received into its pinned bounce buffer, then copied to the device.
+  auto const window      = kvikio::detail::direct_receive_minimum_receive_size();
+  auto const task_size   = window + 83;
+  auto const read_size   = 2 * task_size + 157;
+  auto const file_offset = std::size_t{113};
+  auto const num_ranges  = 1 + (read_size - 1) / task_size;
+  auto const body        = patterned_body(file_offset + read_size + window, 157U, 41U);
+  LocalHttpServer server{body, true, 0, 0, num_ranges, true};
+  kvikio::RemoteHandle remote_handle(std::make_unique<kvikio::HttpEndpoint>(local_url(server)),
+                                     body.size());
+  constexpr std::size_t guard_size = 29;
+  constexpr char guard_value       = static_cast<char>(0x6d);
+  std::vector<char> output(read_size + 2 * guard_size);
   void* device_output{nullptr};
-  ASSERT_EQ(cudaMalloc(&device_output, 1), cudaSuccess);
+  ASSERT_EQ(cudaMalloc(&device_output, output.size()), cudaSuccess);
+  ASSERT_EQ(cudaMemset(device_output, guard_value, output.size()), cudaSuccess);
+  auto* const device_destination = static_cast<char*>(device_output) + guard_size;
+  kvikio::reset_remote_direct_receive_stats();
 
-  EXPECT_THAT([&] { std::ignore = remote_handle.pread(device_output, 1, 0, 1); },
-              ThrowsMessage<std::runtime_error>(HasSubstr("host destinations only")));
-  EXPECT_EQ(endpoint_ptr->setopt_calls, 0);
-  EXPECT_EQ(endpoint_ptr->range_request_calls, 0);
+  EXPECT_EQ(remote_handle.pread(device_destination, read_size, file_offset, task_size).get(),
+            read_size);
+  ASSERT_EQ(cudaMemcpy(output.data(), device_output, output.size(), cudaMemcpyDeviceToHost),
+            cudaSuccess);
   EXPECT_EQ(cudaFree(device_output), cudaSuccess);
+  auto const* const destination = output.data() + guard_size;
+  EXPECT_TRUE(
+    std::equal(body.begin() + file_offset, body.begin() + file_offset + read_size, destination));
+  EXPECT_TRUE(all_equal(output.data(), destination, guard_value));
+  EXPECT_TRUE(all_equal(destination + read_size, output.data() + output.size(), guard_value));
+
+  auto const stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(stats.transfers_requested, num_ranges);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, num_ranges);
+  EXPECT_EQ(stats.copied_stream_body_bytes, read_size);
+  EXPECT_EQ(stats.direct_placement_bytes + stats.framing_compaction_bytes, read_size);
+  EXPECT_GT(stats.direct_placement_bytes, 0);
+}
+
+TEST(RemoteDirectReceive, device_receive_requeues_a_retryable_http_failure)
+{
+  if (!kvikio::remote_direct_receive_supported()) { GTEST_SKIP() << "no libcurl support"; }
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  RestoreHttpRetryPolicy const restore_retry;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::defaults::set_http_max_attempts(2);
+  kvikio::defaults::set_http_status_codes({503});
+
+  // The retry returns the pinned bounce buffer and takes one again when it is admitted.
+  auto const body =
+    patterned_body(2 * kvikio::detail::direct_receive_minimum_receive_size() + 251, 193U, 29U);
+  LocalHttpServer server{body, true, 1};
+  kvikio::RemoteHandle remote_handle(std::make_unique<kvikio::HttpEndpoint>(local_url(server)),
+                                     body.size());
+  std::vector<char> output(body.size(), '\0');
+  void* device_output{nullptr};
+  ASSERT_EQ(cudaMalloc(&device_output, output.size()), cudaSuccess);
+  kvikio::reset_remote_direct_receive_stats();
+
+  EXPECT_EQ(remote_handle.pread(device_output, output.size(), 0, output.size()).get(), body.size());
+  ASSERT_EQ(cudaMemcpy(output.data(), device_output, output.size(), cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  EXPECT_EQ(cudaFree(device_output), cudaSuccess);
+  EXPECT_TRUE(std::equal(body.begin(), body.end(), output.begin()));
+
+  auto const stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(stats.transfers_requested, 1);
+  EXPECT_EQ(stats.retries, 1);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+  EXPECT_EQ(stats.transfers_failed, 0);
+  EXPECT_EQ(stats.direct_placement_bytes + stats.framing_compaction_bytes, body.size());
 }
 
 TEST(RemoteDirectReceive, prefer_counts_an_easy_threadpool_read_as_ineligible)

@@ -442,6 +442,18 @@ void configure_direct_receive_transfer(RemoteMultiTransfer& transfer,
 
 #if defined(KVIKIO_HAS_CURL_DIRECT_RECEIVE)
 
+namespace {
+/**
+ * @brief Where a direct receive transfer's body lands: the caller's buffer for a host read, or the
+ * pinned bounce buffer for a device read, which `stage_device_copy()` then copies to the device.
+ */
+char* direct_receive_destination(RemoteMultiTransfer& transfer)
+{
+  if (transfer.is_device) { return static_cast<char*>(transfer.ctx.pinned_buffer); }
+  return transfer.ctx.buf;
+}
+}  // namespace
+
 void MultiPollReactor::lend_direct_receive_buffer(RemoteMultiTransfer& transfer, bool resume)
 {
   auto& direct_receive = *transfer.direct_receive;
@@ -454,10 +466,11 @@ void MultiPollReactor::lend_direct_receive_buffer(RemoteMultiTransfer& transfer,
   if (callbacks.response_body_accepted()) {
     // The final response headers are validated. Lend the unfilled rest of the destination, which
     // keeps receiving until the range is complete.
-    callbacks.install_buffer(transfer.ctx.buf + placed, transfer.ctx.size - placed, false);
+    callbacks.install_buffer(
+      direct_receive_destination(transfer) + placed, transfer.ctx.size - placed, false);
     direct_receive.buffer_is_destination = true;
   } else {
-    // Headers may still arrive. They must not land in the caller's buffer.
+    // Headers may still arrive. They must not land in the destination.
     if (direct_receive.header_window.empty()) {
       direct_receive.header_window.resize(direct_receive_minimum_receive_size());
     }
@@ -488,10 +501,11 @@ void MultiPollReactor::place_direct_receive_buffer(RemoteMultiTransfer& transfer
                 std::logic_error);
   auto const body_begin = body_end - released.body_bytes;
 
+  char* const destination = direct_receive_destination(transfer);
   void const* source{nullptr};
   std::size_t source_capacity{0};
   if (direct_receive.buffer_is_destination) {
-    source          = transfer.ctx.buf + direct_receive.buffer_body_offset;
+    source          = destination + direct_receive.buffer_body_offset;
     source_capacity = transfer.ctx.size - direct_receive.buffer_body_offset;
   } else {
     source          = direct_receive.header_window.data();
@@ -500,7 +514,7 @@ void MultiPollReactor::place_direct_receive_buffer(RemoteMultiTransfer& transfer
   auto const placement = place_direct_receive_on_host(source,
                                                       source_capacity,
                                                       released,
-                                                      transfer.ctx.buf,
+                                                      destination,
                                                       transfer.ctx.size,
                                                       body_begin,
                                                       direct_receive.buffer_is_destination);
@@ -595,6 +609,7 @@ void MultiPollReactor::settle_direct_receive_transfer(std::unique_ptr<RemoteMult
           direct_receive_record_copied_completion(callbacks.raw_bytes(), callbacks.body_bytes());
         }
         direct_receive_record_placement(direct_receive.direct_bytes, direct_receive.staged_bytes);
+        if (transfer->is_device) { stage_device_copy(*transfer); }
         // Before the aggregate, which may make the caller's future ready.
         transfer->physical_recorder->finish(transfer->ctx.size);
         transfer->aggregate->on_subrange_complete(transfer->ctx.size);

@@ -968,10 +968,9 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   bool direct_receive_strict_attempt{false};
   bool record_ineligible_direct_receive{false};
   if (direct_receive_mode != RemoteDirectReceiveMode::OFF) {
-    bool const eligible_backend     = io_backend == RemoteIOBackend::MULTI_POLL;
-    bool const eligible_build       = remote_direct_receive_supported();
-    bool const eligible_endpoint    = _endpoint->supports_exact_http_range();
-    bool const eligible_destination = is_host_mem;
+    bool const eligible_backend  = io_backend == RemoteIOBackend::MULTI_POLL;
+    bool const eligible_build    = remote_direct_receive_supported();
+    bool const eligible_endpoint = _endpoint->supports_exact_http_range();
     if (direct_receive_mode == RemoteDirectReceiveMode::REQUIRE) {
       KVIKIO_EXPECT(eligible_backend,
                     "remote direct receive REQUIRE needs the MULTI_POLL backend",
@@ -983,12 +982,8 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
       KVIKIO_EXPECT(eligible_endpoint,
                     "remote direct receive REQUIRE needs an exact-range HTTP or S3 endpoint",
                     std::runtime_error);
-      KVIKIO_EXPECT(eligible_destination,
-                    "remote direct receive REQUIRE currently supports host destinations only",
-                    std::runtime_error);
     }
-    use_direct_receive =
-      eligible_backend && eligible_build && eligible_endpoint && eligible_destination;
+    use_direct_receive               = eligible_backend && eligible_build && eligible_endpoint;
     record_ineligible_direct_receive = !use_direct_receive;
   }
   if (use_direct_receive) {
@@ -1120,23 +1115,26 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
     transfer->retry_policy = retry_policy;
     transfer->file_offset  = cur_off;
     transfer->physical     = physical;
-    if (use_direct_receive) {
-      // The reactor lends libcurl a header window first and then the destination itself. The
-      // ordinary write callback and its copy are not used.
+    if (is_host_mem) {
       transfer->ctx.buf = cur_buf;
-      detail::configure_direct_receive_transfer(*transfer,
-                                                _direct_receive_snapshot,
-                                                direct_receive_strict_attempt,
-                                                direct_receive_mode ==
-                                                  RemoteDirectReceiveMode::PREFER);
-    } else if (is_host_mem) {
-      transfer->ctx.buf = cur_buf;
-      transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_host_memory);
-      transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
     } else {
       transfer->is_device  = true;
       transfer->device_ctx = io_event_barrier->cuda_context();
       transfer->device_dst = cur_buf;
+    }
+    if (use_direct_receive) {
+      // The reactor lends libcurl a header window first and then the destination itself, which for
+      // a device read is its pinned bounce buffer. The ordinary write callback and its copy are not
+      // used.
+      detail::configure_direct_receive_transfer(
+        *transfer,
+        _direct_receive_snapshot,
+        direct_receive_strict_attempt,
+        direct_receive_mode == RemoteDirectReceiveMode::PREFER);
+    } else if (is_host_mem) {
+      transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_host_memory);
+      transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
+    } else {
       transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_pinned_buffer);
       transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
     }
