@@ -21,14 +21,23 @@ function(find_and_configure_libcurl)
   # a CA bundle, every TLS connection re-parses the whole bundle. Set these as cache variables, not
   # in OPTIONS below. curl's CMake ignores an OPTIONS value on a fresh configure, and undesirably
   # uses "none" as the path on a reconfigure.
-  set(CURL_CA_BUNDLE
-      "none"
-      CACHE STRING "No compile-time default CA bundle for the bundled libcurl" FORCE
-  )
-  set(CURL_CA_PATH
-      "none"
-      CACHE STRING "No compile-time default CA directory for the bundled libcurl" FORCE
-  )
+  #
+  # Only do this when KvikIO builds libcurl itself. If a parent project has already created the
+  # libcurl target, rapids_cpm_find() below reuses it without building anything, so these cache
+  # entries are never consumed here. They would instead survive into the parent's next configure,
+  # where the parent's libcurl picks them up and loses its compile-time CA defaults. Other users of
+  # that libcurl that rely on those defaults, such as the AWS SDK in Velox, then fail every TLS
+  # certificate check.
+  if(NOT TARGET libcurl)
+    set(CURL_CA_BUNDLE
+        "none"
+        CACHE STRING "No compile-time default CA bundle for the bundled libcurl" FORCE
+    )
+    set(CURL_CA_PATH
+        "none"
+        CACHE STRING "No compile-time default CA directory for the bundled libcurl" FORCE
+    )
+  endif()
 
   rapids_cpm_find(
     CURL 8.13.0
