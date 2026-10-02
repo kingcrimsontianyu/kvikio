@@ -72,7 +72,7 @@ enum class RemoteIOBackend : uint8_t {
  * @brief How sub-ranges of a single `pread()` are distributed across reactor threads when the
  * `MULTI_POLL` backend is active.
  *
- * Controlled by `KVIKIO_REMOTE_IO_REACTOR_DISPATCH`. When only one reactor is used, both modes are
+ * Controlled by `KVIKIO_REMOTE_IO_REACTOR_DISPATCH`. When only one reactor is used, all modes are
  * equivalent.
  */
 enum class RemoteReactorDispatch : uint8_t {
@@ -86,6 +86,11 @@ enum class RemoteReactorDispatch : uint8_t {
         ///< itself chosen round-robin per `pread()` call). The sub-ranges then share that reactor's
         ///< libcurl connection cache, allowing an established TCP/TLS connection to be reused. Best
         ///< for HTTPS, where the TLS handshake cost is non-trivial.
+  SHARED_QUEUE = 2,  ///< Sub-ranges wait in one queue shared by all reactors, and a reactor pulls
+                     ///< one only once it has capacity to start it. Binding at execution time
+                     ///< rather than submission time avoids stranding work behind a busy reactor.
+                     ///< Costs a lock per admission. Requires a non-zero
+                     ///< `KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS`, which paces the queue.
 };
 
 /**
@@ -377,6 +382,8 @@ struct RemoteBatchReadOptions {
    * @brief Overrides `KVIKIO_REMOTE_IO_REACTOR_DISPATCH` for this call.
    *
    * `PER_PREAD` means one reactor per file here, since a batch may span several files.
+   * `SHARED_QUEUE` takes effect only if the process runs `SHARED_QUEUE` too. Otherwise it falls
+   * back to `PER_CHUNK`.
    */
   std::optional<RemoteReactorDispatch> dispatch{std::nullopt};
 
