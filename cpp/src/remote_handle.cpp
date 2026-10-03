@@ -1102,15 +1102,10 @@ std::vector<std::future<std::size_t>> RemoteHandle::batch_read(
       "RemoteHandle::batch_read: EASY_THREADPOOL does not implement coalescing. "
       "`backend` (with EASY_THREADPOOL explicitly) and `coalesce_max_gap` cannot be used together",
       std::invalid_argument);
-    KVIKIO_EXPECT(!opts.dispatch.has_value(),
-                  "RemoteHandle::batch_read: EASY_THREADPOOL has no reactors, so `dispatch` has no "
-                  "meaning there",
-                  std::invalid_argument);
-  } else if (io_backend == RemoteIOBackend::EASY_THREADPOOL &&
-             (opts.coalesce_max_gap.has_value() || opts.dispatch.has_value())) {
+  } else if (io_backend == RemoteIOBackend::EASY_THREADPOOL && opts.coalesce_max_gap.has_value()) {
     KVIKIO_LOG_WARN(
-      "RemoteHandle::batch_read: ignoring `coalesce_max_gap` and `dispatch`, since the process "
-      "default selected the EASY_THREADPOOL backend");
+      "RemoteHandle::batch_read: ignoring `coalesce_max_gap`, since the process default selected "
+      "the EASY_THREADPOOL backend");
   }
 
   KVIKIO_EXPECT(task_size > 0, "`task_size` must be positive", std::invalid_argument);
@@ -1239,25 +1234,8 @@ std::vector<std::future<std::size_t>> RemoteHandle::batch_read(
     transfers.push_back(std::move(transfer));
   }
 
-  // One pool call per group, so PER_PREAD gives each file its own reactor and connection cache.
-  // The planner emits a group's transfers contiguously, so one scan finds the boundaries.
-  auto& pool              = detail::MultiReactorPool::instance();
-  std::size_t group_begin = 0;
-  for (std::size_t i = 1; i <= plan.transfers.size(); ++i) {
-    bool const at_boundary =
-      (i == plan.transfers.size()) ||
-      plan.transfers[i].handle != plan.transfers[group_begin].handle ||
-      plan.transfers[i].cuda_context != plan.transfers[group_begin].cuda_context;
-    if (!at_boundary) { continue; }
-
-    std::vector<std::unique_ptr<detail::RemoteMultiTransfer>> group;
-    group.reserve(i - group_begin);
-    for (auto k = group_begin; k < i; ++k) {
-      group.push_back(std::move(transfers[k]));
-    }
-    pool.submit_transfers(std::move(group), opts.dispatch);
-    group_begin = i;
-  }
+  // One pool call for the whole batch.
+  detail::MultiReactorPool::instance().submit_transfers(std::move(transfers));
 
   return futures;
 }

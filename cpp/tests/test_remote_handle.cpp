@@ -271,21 +271,6 @@ TEST_F(BatchReadTest, naming_easy_backend_and_coalescing_together_throws)
     ThrowsMessage<std::invalid_argument>(HasSubstr("does not implement coalescing")));
 }
 
-TEST_F(BatchReadTest, naming_easy_backend_and_dispatch_together_throws)
-{
-  auto handle = make_handle();
-  std::vector<kvikio::RemoteReadRequest> requests{
-    {.handle = &handle, .buf = _buffer.data(), .size = 10}};
-
-  EXPECT_THAT(
-    [&] {
-      kvikio::RemoteHandle::batch_read(requests,
-                                       {.backend  = kvikio::RemoteIOBackend::EASY_THREADPOOL,
-                                        .dispatch = kvikio::RemoteReactorDispatch::PER_CHUNK});
-    },
-    ThrowsMessage<std::invalid_argument>(HasSubstr("has no reactors")));
-}
-
 TEST_F(BatchReadTest, zero_task_size_throws)
 {
   auto handle = make_handle();
