@@ -145,15 +145,18 @@ CurlHandle::CurlHandle(LibCurl::UniqueHandlePtr handle,
   if (verbose) { setopt(CURLOPT_VERBOSE, 1L); }
 
   // Size in bytes of libcurl's receive buffer, one per transfer. When unset, libcurl's own default
-  // of 16 KiB is used. The value must be positive, and is clamped to between 1 KiB and 10 MiB.
-  static std::optional<long> const buffer_size = []() -> std::optional<long> {
-    if (std::getenv("KVIKIO_REMOTE_IO_BUFFER_SIZE") == nullptr) { return std::nullopt; }
-    auto const requested = getenv_or("KVIKIO_REMOTE_IO_BUFFER_SIZE", ssize_t{0});
-    KVIKIO_EXPECT(
-      requested > 0, "KVIKIO_REMOTE_IO_BUFFER_SIZE must be positive", std::invalid_argument);
-    return static_cast<long>(std::clamp(requested, ssize_t{1024}, ssize_t{CURL_MAX_READ_SIZE}));
+  // of 16 KiB (CURL_MAX_WRITE_SIZE) is used. The value must be between 1 KiB and
+  // CURL_MAX_READ_SIZE (10 MiB in recent versions of curl).
+  static long const buffer_size = [] {
+    auto const env =
+      getenv_or("KVIKIO_REMOTE_IO_BUFFER_SIZE", static_cast<long>(CURL_MAX_WRITE_SIZE));
+    KVIKIO_EXPECT(env >= 1024 && env <= CURL_MAX_READ_SIZE,
+                  "KVIKIO_REMOTE_IO_BUFFER_SIZE has to be an integer between 1024 and " +
+                    std::to_string(CURL_MAX_READ_SIZE),
+                  std::invalid_argument);
+    return env;
   }();
-  if (buffer_size.has_value()) { setopt(CURLOPT_BUFFERSIZE, buffer_size.value()); }
+  setopt(CURLOPT_BUFFERSIZE, buffer_size);
 
   // Bind every connection to one network interface, for hosts with several NICs on one subnet.
   // The value is passed to libcurl verbatim: `<ip>` binds the source address, `if!<name>` binds
