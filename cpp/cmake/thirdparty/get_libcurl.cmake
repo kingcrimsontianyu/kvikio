@@ -14,31 +14,15 @@ function(find_and_configure_libcurl)
     set(CACHE_HAS_BUILD_TESTING $CACHE{BUILD_TESTING})
   endif()
 
-  # Build libcurl without a default CA bundle or CA directory, relying instead on KvikIO's runtime
-  # CA setup defined in tls.cpp. This is a workaround for a performance bug in curl >=8.21.0. Since
-  # curl 8.21.0, the compile-time defaults are still used even when KvikIO sets CURLOPT_CAINFO or
-  # CURLOPT_CAPATH to NULL. A CA directory disables libcurl's CA store cache, and when combined with
-  # a CA bundle, every TLS connection re-parses the whole bundle. Set these as cache variables, not
-  # in OPTIONS below. curl's CMake ignores an OPTIONS value on a fresh configure, and undesirably
-  # uses "none" as the path on a reconfigure.
-  set(CURL_CA_BUNDLE
-      "none"
-      CACHE STRING "No compile-time default CA bundle for the bundled libcurl" FORCE
-  )
-  set(CURL_CA_PATH
-      "none"
-      CACHE STRING "No compile-time default CA directory for the bundled libcurl" FORCE
-  )
-
   # Remote direct receive needs libcurl's caller-owned receive buffers and strict RX kTLS, which are
-  # experimental extensions not yet in upstream curl. The fetched fallback is a curl 8.22.0-dev fork
+  # experimental extensions not yet in upstream curl. The fetched fallback is a curl 8.23.1-dev fork
   # that provides them. KvikIO still builds against any other libcurl, without direct receive.
   rapids_cpm_find(
-    CURL 8.22.0
+    CURL 8.23.0
     GLOBAL_TARGETS libcurl
     CPM_ARGS
-    GIT_REPOSITORY https://github.com/kjmph/curl.git
-    GIT_TAG 1c7a9684406103c9ab226ad7671f46322799653f
+    GIT_REPOSITORY https://github.com/kingcrimsontianyu/curl.git
+    GIT_TAG 3ca6c626a9d9ea2ac8262e8af46bdd0185bd8e3a
     OPTIONS "BUILD_CURL_EXE OFF" "BUILD_SHARED_LIBS OFF" "BUILD_TESTING OFF" "CURL_USE_LIBPSL OFF"
             "CURL_DISABLE_LDAP ON" "CMAKE_POSITION_INDEPENDENT_CODE ON"
     EXCLUDE_FROM_ALL YES # Don't install libcurl.a (only needed when building libkvikio.so)
