@@ -44,7 +44,7 @@ function(kvikio_add_benchmark)
                CUDA_STANDARD_REQUIRED ON
   )
 
-  target_link_libraries(${_KVIKIO_NAME} PUBLIC benchmark::benchmark kvikio::kvikio)
+  target_link_libraries(${_KVIKIO_NAME} PUBLIC kvikio::kvikio)
 
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(KVIKIO_CXX_FLAGS "-Wall;-Werror;-Wno-unknown-pragmas")
@@ -60,3 +60,17 @@ function(kvikio_add_benchmark)
 endfunction()
 
 kvikio_add_benchmark(NAME THREADPOOL_BENCHMARK SOURCES "threadpool/threadpool_benchmark.cpp")
+target_link_libraries(THREADPOOL_BENCHMARK PUBLIC benchmark::benchmark)
+
+kvikio_add_benchmark(
+  NAME
+  REMOTE_IO_BENCHMARK
+  SOURCES
+  "io/remote_io_benchmark.cpp"
+  "io/common/buffer.cpp"
+  "io/common/json.cpp"
+  "io/common/latency_monitor.cpp"
+  "io/common/options.cpp"
+  "io/common/system_usage.cpp"
+)
+target_link_libraries(REMOTE_IO_BENCHMARK PUBLIC CUDA::cudart_static)
